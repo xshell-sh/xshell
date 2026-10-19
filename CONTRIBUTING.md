@@ -18,7 +18,7 @@ Contributions are accepted under the [MIT License](./LICENSE).
 
 1. Clone the repository and install dependencies:
    ```bash
-   git clone https://github.com/MertPROJ/xshell.git
+   git clone https://github.com/xshell-sh/xshell.git
    cd xshell
    npm install
    ```

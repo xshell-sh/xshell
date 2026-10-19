@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 
-const REPO = "MertPROJ/xshell";
+const REPO = "xshell-sh/xshell";
 
 export interface ReleaseEntry {
   version: string;

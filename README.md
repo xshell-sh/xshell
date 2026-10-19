@@ -7,8 +7,8 @@
 **A tiny IDE for your AI CLI agents.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?labelColor=1a1a1a)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-7aa2f7?labelColor=1a1a1a)](https://github.com/MertPROJ/xshell/releases/latest)
-[![Latest Release](https://img.shields.io/github/v/release/MertPROJ/xshell?labelColor=1a1a1a&color=e0af68)](https://github.com/MertPROJ/xshell/releases/latest)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-7aa2f7?labelColor=1a1a1a)](https://github.com/xshell-sh/xshell/releases/latest)
+[![Latest Release](https://img.shields.io/github/v/release/xshell-sh/xshell?labelColor=1a1a1a&color=e0af68)](https://github.com/xshell-sh/xshell/releases/latest)
 [![Built with Tauri](https://img.shields.io/badge/Built_with-Tauri_2-FFC131?logo=tauri&labelColor=1a1a1a)](https://tauri.app/)
 [![Built with Rust](https://img.shields.io/badge/Built_with-Rust-DEA584?logo=rust&labelColor=1a1a1a)](https://www.rust-lang.org/)
 
@@ -84,7 +84,7 @@ irm https://xshell.sh/install.ps1 | iex
 curl -fsSL https://xshell.sh/install.sh | bash
 ```
 
-The script downloads the right binary for your platform from the [latest GitHub release](https://github.com/MertPROJ/xshell/releases/latest) into `~/.xshell/bin/`, drops a Start Menu / `.desktop` entry, adds itself to `PATH`, and launches the app. Re-run the same command to update.
+The script downloads the right binary for your platform from the [latest GitHub release](https://github.com/xshell-sh/xshell/releases/latest) into `~/.xshell/bin/`, drops a Start Menu / `.desktop` entry, adds itself to `PATH`, and launches the app. Re-run the same command to update.
 
 ### Or download an installer directly
 
