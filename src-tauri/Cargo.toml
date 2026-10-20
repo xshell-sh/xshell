@@ -25,6 +25,8 @@ uuid = { version = "1", features = ["v4"] }
 # depend on a system libsqlite. md5: Cursor keys chat folders by md5 of the workspace cwd.
 rusqlite = { version = "0.31", features = ["bundled"] }
 md5 = "0.7"
+listeners = "0.6"
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 # Dev profile: fast incremental rebuilds, light optimization for deps
 [profile.dev]

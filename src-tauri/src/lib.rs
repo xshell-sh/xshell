@@ -2064,6 +2064,12 @@ fn spawn_terminal(state: State<'_, AppState>, id: String, session_id: Option<Str
     // (telemetry reads `terminal.type` from TERM_PROGRAM; without this we'd land in the
     // Unknown bucket). Always set — no user-facing toggle.
     cmd.env("TERM_PROGRAM", "xshell.sh");
+    // Lets list_dev_servers tie a server back to the tab whose session started it
+    // (inherited by every child, including through Git Bash).
+    cmd.env("XSHELL_TAB_ID", &id);
+    // When xshell itself was started from inside a Claude Code session (e.g. `tauri dev` run by
+    // an agent), this marker is inherited and makes every Claude tab skip saving transcripts.
+    cmd.env_remove("CLAUDE_CODE_CHILD_SESSION");
     // Claude Code's flicker-free / alternate-screen-buffer renderer is opt-in via env var.
     // Default ON for any claude-mode spawn; raw shells don't get it (no claude process to read it).
     // Inherited by the wrapping shell → claude child, so setting it here is sufficient.
@@ -3319,6 +3325,115 @@ async fn detect_agent_binary(binary: String) -> Result<AgentBinaryProbe, String>
 
 // ── App Setup ──────────────────────────────────────────────────────────
 
+// ── Dev servers ───────────────────────────────────────────────────────
+// Local servers (npm run dev, astro dev, …) that an agent or the user started for a project.
+// Claude Code runs commands through Git Bash, whose fork emulation breaks the Windows
+// parent-process chain, so servers can't be found by walking xshell's process tree. Instead,
+// every listening TCP socket on a local address is matched by its owning process's
+// environment (XSHELL_TAB_ID, set on each spawned tab and inherited through any shell) and
+// working directory (inside an added project folder).
+#[derive(Debug, Serialize, Clone)]
+pub struct DevServer {
+    pub port: u16,
+    pub pid: u32,
+    pub process_name: String,
+    pub cwd: String,
+    // Deepest added project folder containing cwd; empty when only the tab marker matched.
+    pub project_path: String,
+    // The xshell tab whose session started the server, when known.
+    pub tab_id: Option<String>,
+}
+
+// Ports from the OS's dynamic range (Windows and IANA: 49152+) are picked at random for
+// short-lived helpers (auth callbacks, tool servers); dev servers use fixed lower ports.
+const DEV_SERVER_MAX_PORT: u16 = 49151;
+
+// Agent CLIs and xshell itself may hold sockets of their own; those aren't dev servers.
+const DEV_SERVER_IGNORED_PROCESSES: [&str; 6] = ["claude", "codex", "cursor-agent", "opencode", "agy", "xshell"];
+
+fn path_within(child: &str, parent: &str) -> bool {
+    let norm = |s: &str| s.replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    let (c, p) = (norm(child), norm(parent));
+    !p.is_empty() && (c == p || c.starts_with(&format!("{}\\", p)))
+}
+
+fn scan_dev_servers(project_paths: Vec<String>) -> Vec<DevServer> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let Ok(all) = listeners::get_all() else { return vec![] };
+    let own_pid = std::process::id();
+    // (pid, port, process name), one entry per port even when bound on IPv4 and IPv6.
+    let mut sockets: Vec<(u32, u16, String)> = vec![];
+    for l in all {
+        let ip = l.socket.ip();
+        if l.protocol != listeners::Protocol::TCP || !(ip.is_loopback() || ip.is_unspecified()) || l.process.pid == own_pid { continue; }
+        if l.socket.port() > DEV_SERVER_MAX_PORT { continue; }
+        let lower = l.process.name.to_lowercase();
+        if DEV_SERVER_IGNORED_PROCESSES.iter().any(|n| lower.starts_with(n)) { continue; }
+        if !sockets.iter().any(|(pid, port, _)| *pid == l.process.pid && *port == l.socket.port()) {
+            sockets.push((l.process.pid, l.socket.port(), l.process.name.clone()));
+        }
+    }
+    if sockets.is_empty() { return vec![]; }
+
+    let mut pids: Vec<Pid> = sockets.iter().map(|(pid, _, _)| Pid::from_u32(*pid)).collect();
+    pids.dedup();
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&pids), true,
+        ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always).with_environ(UpdateKind::Always));
+
+    let mut out: Vec<DevServer> = vec![];
+    for (pid, port, process_name) in sockets {
+        let Some(p) = sys.process(Pid::from_u32(pid)) else { continue };
+        let cwd = p.cwd().map(|c| c.to_string_lossy().into_owned()).unwrap_or_default();
+        let tab_id = p.environ().iter().find_map(|e| e.to_string_lossy().strip_prefix("XSHELL_TAB_ID=").map(|s| s.to_string()));
+        let project_path = project_paths.iter().filter(|pp| path_within(&cwd, pp)).max_by_key(|pp| pp.len()).cloned();
+        if project_path.is_none() && tab_id.is_none() { continue; }
+        out.push(DevServer { port, pid, process_name, cwd, project_path: project_path.unwrap_or_default(), tab_id });
+    }
+    out.sort_by_key(|s| s.port);
+    out
+}
+
+// Stops a server listed by scan_dev_servers (re-checked here, so the frontend can't use this
+// to kill arbitrary processes). On Windows the whole process tree goes, so helper processes
+// (esbuild, workers) don't linger.
+fn kill_dev_server(pid: u32, project_paths: Vec<String>) -> Result<(), String> {
+    if !scan_dev_servers(project_paths).iter().any(|s| s.pid == pid) {
+        return Err("not a running dev server".into());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let status = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .status()
+            .map_err(|e| e.to_string())?;
+        if status.success() { Ok(()) } else { Err(format!("taskkill exited with {}", status)) }
+    }
+    #[cfg(not(windows))]
+    {
+        let mut sys = sysinfo::System::new();
+        let p = sysinfo::Pid::from_u32(pid);
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[p]), true);
+        match sys.process(p) {
+            Some(proc_) if proc_.kill() => Ok(()),
+            _ => Err("could not stop process".into()),
+        }
+    }
+}
+
+// Both run on the blocking pool: the socket and process scans take a few to tens of ms.
+#[tauri::command]
+async fn list_dev_servers(project_paths: Vec<String>) -> Result<Vec<DevServer>, String> {
+    tauri::async_runtime::spawn_blocking(move || scan_dev_servers(project_paths)).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn stop_dev_server(pid: u32, project_paths: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || kill_dev_server(pid, project_paths)).await.map_err(|e| e.to_string())?
+}
+
 pub fn run() {
     cleanup_old_dropped_files();
     tauri::Builder::default()
@@ -3327,7 +3442,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(AppState { terminals: Mutex::new(HashMap::new()) })
-        .invoke_handler(tauri::generate_handler![list_claude_projects, get_sessions, get_all_recent_sessions, get_session_messages, read_image_base64, save_dropped_file, read_text_file, reveal_in_explorer, list_dir, search_dir, open_url, get_username, get_home_dir, get_project_skills, get_project_memories, get_git_status, get_git_log, git_diff, git_stage, git_unstage, git_discard, list_git_branches, git_checkout, list_project_session_ids, detect_session_branch, probe_statusline_setup, get_global_rate_limits, detect_agent_binary, list_codex_projects, list_cursor_projects, list_opencode_projects, list_antigravity_projects, get_codex_context, get_cursor_context, get_opencode_context, get_antigravity_context, get_claude_cost_summary, get_codex_usage, spawn_terminal, write_terminal, resize_terminal, close_terminal])
+        .invoke_handler(tauri::generate_handler![list_dev_servers, stop_dev_server, list_claude_projects, get_sessions, get_all_recent_sessions, get_session_messages, read_image_base64, save_dropped_file, read_text_file, reveal_in_explorer, list_dir, search_dir, open_url, get_username, get_home_dir, get_project_skills, get_project_memories, get_git_status, get_git_log, git_diff, git_stage, git_unstage, git_discard, list_git_branches, git_checkout, list_project_session_ids, detect_session_branch, probe_statusline_setup, get_global_rate_limits, detect_agent_binary, list_codex_projects, list_cursor_projects, list_opencode_projects, list_antigravity_projects, get_codex_context, get_cursor_context, get_opencode_context, get_antigravity_context, get_claude_cost_summary, get_codex_usage, spawn_terminal, write_terminal, resize_terminal, close_terminal])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

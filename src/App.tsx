@@ -20,6 +20,8 @@ import { GroupView } from "./components/GroupView";
 import { countLeaves, collectLeafIds, insertLeaf, removeLeaf, setRatioAt, DropZone } from "./layout";
 import { useUpdateCheck } from "./hooks/useUpdateCheck";
 import { UpdateDialog } from "./components/UpdateDialog";
+import { useDevServers, devServersForTab } from "./hooks/useDevServers";
+import type { DevServer } from "./types";
 
 // Flatten sidebar items to an ordered list of project paths (folders expanded in place).
 // Used to derive `savedPaths` for downstream code that doesn't care about folders.
@@ -70,6 +72,9 @@ function DropZoneOverlay({ targetTabId, zone }: { targetTabId: string; zone: "le
   if (zone === "bottom") box = { left,                    top: top + fullH * 0.5,  width: fullW,       height: fullH * 0.5 };
   return <div className="drop-zone-preview" style={box} />;
 }
+
+// Stable empty list so tabs without servers don't re-render on every poll.
+const NO_DEV_SERVERS: DevServer[] = [];
 
 export default function App() {
   const [allProjects, setAllProjects] = useState<ProjectInfo[]>([]);
@@ -418,6 +423,23 @@ export default function App() {
     const interval = setInterval(syncTitles, 5000);
     return () => clearInterval(interval);
   }, [tabs.length, allProjects]); // Only re-setup when tab count or projects change
+
+  // Dev servers (npm run dev, …) for every added project and open tab, polled every few seconds.
+  // Each tab gets the servers its session started or that run inside its project folder.
+  const devServerPaths = useMemo(() => [...savedPaths, ...tabs.map(t => t.projectPath || "")], [savedPaths, tabs]);
+  const { servers: devServers, refresh: refreshDevServers } = useDevServers(devServerPaths);
+  const devServersByTab = useMemo(() => {
+    const map = new Map<string, DevServer[]>();
+    for (const t of tabs) {
+      const list = devServersForTab(devServers, t.id, t.projectPath);
+      if (list.length) map.set(t.id, list);
+    }
+    return map;
+  }, [devServers, tabs]);
+  const handleStopDevServer = useCallback(async (pid: number) => {
+    try { await invoke("stop_dev_server", { pid, projectPaths: devServerPaths }); } catch (_) {}
+    refreshDevServers();
+  }, [devServerPaths, refreshDevServers]);
 
   // ── Persistence ───────────────────────────────────────────────────
   const persistPaths = useCallback(async (paths: string[]) => {
@@ -1132,7 +1154,7 @@ export default function App() {
           <span>Loading...</span>
         </div>
       )}
-      <TabBar tabs={tabs} entries={entries} onRenameGroup={(id, name) => setGroups(prev => prev.map(g => g.id === id ? { ...g, name } : g))} closingTabIds={closingTabIds} activeTabId={activeTabId} selectedProject={selectedProject} hoveredProjectPath={hoveredProjectPath} linkedProjectPath={activeTabProjectPath} activeTabProject={contextProject} openSessionIds={new Set(tabs.filter(t => t.sessionId).map(t => t.sessionId!))} projectIcons={projectIcons} pinnedProjects={userProjects} sidebarCollapsed={sidebarCollapsed} defaultShell={defaultShell} installedAgents={installedAgents} updateAvailable={updateInfo.updateAvailable} onExpandSidebar={() => setSidebarCollapsed(false)} onSelectTab={handleSelectTab} onCloseTab={handleCloseTab} onReorderTabs={handleReorderTabs} onNewChat={handleNewChat} onNewChatInActive={handleNewChatInActive} onNewShellInContext={handleNewShellInContext} onOpenSession={handleOpenSession} onNewShell={handleNewShell} onGoHome={handleGoHome} onOpenSettings={() => setActiveTabId("settings")} onToggleSidebar={() => setSidebarCollapsed(c => !c)} />
+      <TabBar tabs={tabs} entries={entries} devServersByTab={devServersByTab} onRenameGroup={(id, name) => setGroups(prev => prev.map(g => g.id === id ? { ...g, name } : g))} closingTabIds={closingTabIds} activeTabId={activeTabId} selectedProject={selectedProject} hoveredProjectPath={hoveredProjectPath} linkedProjectPath={activeTabProjectPath} activeTabProject={contextProject} openSessionIds={new Set(tabs.filter(t => t.sessionId).map(t => t.sessionId!))} projectIcons={projectIcons} pinnedProjects={userProjects} sidebarCollapsed={sidebarCollapsed} defaultShell={defaultShell} installedAgents={installedAgents} updateAvailable={updateInfo.updateAvailable} onExpandSidebar={() => setSidebarCollapsed(false)} onSelectTab={handleSelectTab} onCloseTab={handleCloseTab} onReorderTabs={handleReorderTabs} onNewChat={handleNewChat} onNewChatInActive={handleNewChatInActive} onNewShellInContext={handleNewShellInContext} onOpenSession={handleOpenSession} onNewShell={handleNewShell} onGoHome={handleGoHome} onOpenSettings={() => setActiveTabId("settings")} onToggleSidebar={() => setSidebarCollapsed(c => !c)} />
       <div className="app-body">
       <Sidebar projects={userProjects} projectIcons={projectIcons} selectedProject={selectedProject} activeCountByProject={activeCountByProject} sidebarLayout={sidebarLayout} onLayoutChange={persistSidebarLayout} onSelectProject={handleSelectProject} onGoHome={handleGoHome} onRemoveProject={handleRemoveProject} onEditProject={(p) => setEditingProjectPath(p)} onHoverProject={setHoveredProjectPath} onOpenSettings={() => setActiveTabId("settings")} onAddProject={() => setShowProjectPicker(true)} onCollapse={() => setSidebarCollapsed(true)} activeTabId={activeTabId} linkedProjectPath={activeTabProjectPath} showRateLimit={showRateLimitInSidebar} showRateLimitCodex={showRateLimitInSidebarCodex} updateAvailable={updateInfo.updateAvailable} />
       <div className="main-content">
@@ -1221,7 +1243,7 @@ export default function App() {
           // the subtree (which kills the PTY in TerminalTab's cleanup). Keying by tab.id
           // makes a reorder a pure move — the TerminalTab instance, xterm, and PTY survive.
           return createPortal(
-            <TerminalTab tab={tab} isActive={tab.id === activeTabId || (!!tab.groupId && tab.groupId === activeTabId && activeLeafByGroup[tab.groupId] === tab.id)} gitLazyPolling={gitLazyPolling} gitChangesTree={gitChangesTree} fileExplorerOnStart={fileExplorerOnStart} terminalBgColor={terminalBgColor} defaultFontSize={defaultTerminalFontSize} defaultShellId={defaultShell} fullscreenRendering={fullscreenRendering} forceSyncOutput={forceSyncOutput} webglRendering={webglRendering} terminalFontWeight={terminalFontWeight} eagerInit={eagerInitTabs} theme={theme} projectEncodedName={encodedName} showTerminalHeaderStats={showTerminalHeaderStats} onBranchSwitch={handleSwitchTabToBranch} />,
+            <TerminalTab tab={tab} devServers={devServersByTab.get(tab.id) ?? NO_DEV_SERVERS} onStopDevServer={handleStopDevServer} isActive={tab.id === activeTabId || (!!tab.groupId && tab.groupId === activeTabId && activeLeafByGroup[tab.groupId] === tab.id)} gitLazyPolling={gitLazyPolling} gitChangesTree={gitChangesTree} fileExplorerOnStart={fileExplorerOnStart} terminalBgColor={terminalBgColor} defaultFontSize={defaultTerminalFontSize} defaultShellId={defaultShell} fullscreenRendering={fullscreenRendering} forceSyncOutput={forceSyncOutput} webglRendering={webglRendering} terminalFontWeight={terminalFontWeight} eagerInit={eagerInitTabs} theme={theme} projectEncodedName={encodedName} showTerminalHeaderStats={showTerminalHeaderStats} onBranchSwitch={handleSwitchTabToBranch} />,
             host,
             tab.id,
           );

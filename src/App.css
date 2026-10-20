@@ -652,6 +652,18 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .terminal-container .xterm { height: 100%; }
 .terminal-container .xterm-viewport { overflow-y: auto !important; }
 
+/* Dev servers (npm run dev, …) for this tab's session or project: green chips on the right of
+   the terminal header. Click opens the URL; the small square stops the server. */
+.terminal-devservers { display: flex; align-items: center; gap: 6px; margin-left: auto; flex-shrink: 0; }
+.devserver-chip { display: inline-flex; align-items: stretch; border: 1px solid rgba(63, 153, 84, 0.32); border-radius: 10px; background: rgba(63, 153, 84, 0.12); overflow: hidden; }
+.devserver-open { display: inline-flex; align-items: center; gap: 5px; padding: 1px 7px 1px 8px; background: transparent; border: none; color: var(--success); font-family: var(--font-mono); font-size: 10px; cursor: pointer; }
+.devserver-open:hover { background: rgba(63, 153, 84, 0.2); }
+.devserver-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 0 rgba(63, 153, 84, 0.6); animation: devserverPulse 2s ease-out infinite; }
+.devserver-stop { display: inline-flex; align-items: center; padding: 0 6px; background: transparent; border: none; border-left: 1px solid rgba(63, 153, 84, 0.28); color: var(--text-muted); cursor: pointer; }
+.devserver-stop:hover { background: rgba(181, 51, 51, 0.18); color: var(--error); }
+@keyframes devserverPulse { 0% { box-shadow: 0 0 0 0 rgba(63, 153, 84, 0.55); } 70% { box-shadow: 0 0 0 5px rgba(63, 153, 84, 0); } 100% { box-shadow: 0 0 0 0 rgba(63, 153, 84, 0); } }
+.tab-devserver-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--success); flex-shrink: 0; margin: 0 2px; }
+
 /* Loading overlay shown over the terminal until the PTY's first byte arrives — masks
    the blank xterm during Node.js boot + claude TUI first paint. The background inherits
    from the terminal-container itself, so the overlay blends with whatever palette/bg the

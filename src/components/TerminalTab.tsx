@@ -7,12 +7,12 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
-import { GitBranch, ArrowUp, ArrowDown, RefreshCw, ChevronRight, ChevronDown, Plus, Minus, History, GitFork, Pencil, X as XIcon, Check, Search, AlertTriangle, Cloud, FolderTree, FileDiff, RotateCcw } from "lucide-react";
+import { GitBranch, ArrowUp, ArrowDown, RefreshCw, ChevronRight, ChevronDown, Plus, Minus, History, GitFork, Pencil, X as XIcon, Check, Search, AlertTriangle, Cloud, FolderTree, FileDiff, RotateCcw, Square } from "lucide-react";
 import { FileExplorerPanel, DRAG_PATH_MIME } from "./FileExplorerPanel";
 import { fileIconUrl, plainFolderIconUrl } from "../lib/fileIcons";
 import "@xterm/xterm/css/xterm.css";
 import { detectMonoFontFamily, ensureMonoFontsLoaded } from "../lib/fonts";
-import type { Tab, GitStatus, GitFile, GitCommit, BranchInfo, SessionInfo, GitBranch as GitBranchEntry } from "../types";
+import type { Tab, GitStatus, GitFile, GitCommit, BranchInfo, SessionInfo, GitBranch as GitBranchEntry, DevServer } from "../types";
 import { getShellById } from "../shells";
 import { AGENTS } from "../agents";
 import type { ThemeMode } from "./SettingsView";
@@ -130,6 +130,9 @@ async function saveZoom(tabId: string, size: number) {
 interface TerminalTabProps {
   tab: Tab;
   isActive: boolean;
+  // Local dev servers started by this tab's session or running in its project folder.
+  devServers: DevServer[];
+  onStopDevServer: (pid: number) => void;
   gitLazyPolling: boolean;
   gitChangesTree: boolean;
   fileExplorerOnStart: boolean;
@@ -200,7 +203,7 @@ const DEFAULT_PANEL = 280;
 // panel is dragged to its widest, so it can cover almost the whole terminal but stay grabbable.
 const PANEL_EDGE_RESERVE = 76;
 
-export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fileExplorerOnStart, terminalBgColor, defaultFontSize, defaultShellId, fullscreenRendering, forceSyncOutput, webglRendering, terminalFontWeight, eagerInit, theme, projectEncodedName, showTerminalHeaderStats, onBranchSwitch }: TerminalTabProps) {
+export function TerminalTab({ tab, devServers, onStopDevServer, isActive, gitLazyPolling, gitChangesTree, fileExplorerOnStart, terminalBgColor, defaultFontSize, defaultShellId, fullscreenRendering, forceSyncOutput, webglRendering, terminalFontWeight, eagerInit, theme, projectEncodedName, showTerminalHeaderStats, onBranchSwitch }: TerminalTabProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -1028,6 +1031,25 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
         ) : tab.projectPath ? (
           <span className="terminal-header-path" data-tauri-drag-region>{tab.projectPath}</span>
         ) : null}
+        {devServers.length > 0 && (
+          <div className="terminal-devservers">
+            {devServers.map(s => {
+              const url = `http://localhost:${s.port}`;
+              const origin = s.tab_id === tab.id ? "Started by this session" : "Running in this project";
+              return (
+                <span key={`${s.pid}:${s.port}`} className="devserver-chip">
+                  <button className="devserver-open" onClick={() => invoke("open_url", { url }).catch(() => {})} onMouseEnter={(e) => showTt(`${origin} (${s.process_name}, PID ${s.pid}, in ${s.cwd}). Click to open ${url}`, e.currentTarget)} onMouseLeave={hideTt}>
+                    <span className="devserver-dot" />
+                    localhost:{s.port}
+                  </button>
+                  <button className="devserver-stop" onClick={() => onStopDevServer(s.pid)} onMouseEnter={(e) => showTt(`Stop the server on port ${s.port}`, e.currentTarget)} onMouseLeave={hideTt}>
+                    <Square size={8} />
+                  </button>
+                </span>
+              );
+            })}
+          </div>
+        )}
       </div>
       {branchNotice && (
         <div className="branch-banner">

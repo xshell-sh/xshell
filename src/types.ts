@@ -89,6 +89,17 @@ export interface ProjectSettings {
   folders?: SessionFolder[];
 }
 
+// A local server (npm run dev, …) listening on a port, matched to a project folder and/or the
+// xshell tab whose session started it. See scan_dev_servers in lib.rs.
+export interface DevServer {
+  port: number;
+  pid: number;
+  process_name: string;
+  cwd: string;
+  project_path: string;
+  tab_id: string | null;
+}
+
 export interface SessionInfo {
   id: string;
   title: string;

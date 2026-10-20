@@ -5,7 +5,7 @@ import { ShellIcon } from "./ShellIcon";
 import { AGENT_IDS, AGENTS, AgentIcon, type AgentId } from "../agents";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { timeAgo, processSessions } from "../utils";
-import type { ProjectInfo, ProjectSettings, SessionInfo, Tab, Group } from "../types";
+import type { ProjectInfo, ProjectSettings, SessionInfo, Tab, Group, DevServer } from "../types";
 import { getAvailableShells } from "../shells";
 import { collectLeafIds } from "../layout";
 import { Layers } from "lucide-react";
@@ -35,6 +35,8 @@ function TabProjectIcon({ iconValue, color, name, linked }: { iconValue?: string
 export type TabBarEntry = { kind: "tab"; id: string; tab: Tab } | { kind: "group"; id: string; group: Group };
 
 interface TabBarProps {
+  // Dev servers per tab id (see useDevServers); tabs with any get a green dot.
+  devServersByTab: Map<string, DevServer[]>;
   tabs: Tab[];
   entries: TabBarEntry[];
   closingTabIds: Set<string>;
@@ -202,7 +204,7 @@ function TabTooltip({ text, rect }: { text: string; rect: DOMRect }) {
   return <div className="tab-tooltip" ref={ref} style={style}>{text}</div>;
 }
 
-export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProject, hoveredProjectPath, linkedProjectPath, activeTabProject, openSessionIds, projectIcons, pinnedProjects, sidebarCollapsed, defaultShell, installedAgents, updateAvailable, onExpandSidebar, onSelectTab, onCloseTab, onReorderTabs, onNewChat, onNewChatInActive, onNewShellInContext, onOpenSession, onNewShell, onRenameGroup, onGoHome, onOpenSettings, onToggleSidebar }: TabBarProps) {
+export function TabBar({ tabs, entries, devServersByTab, closingTabIds, activeTabId, selectedProject, hoveredProjectPath, linkedProjectPath, activeTabProject, openSessionIds, projectIcons, pinnedProjects, sidebarCollapsed, defaultShell, installedAgents, updateAvailable, onExpandSidebar, onSelectTab, onCloseTab, onReorderTabs, onNewChat, onNewChatInActive, onNewShellInContext, onOpenSession, onNewShell, onRenameGroup, onGoHome, onOpenSettings, onToggleSidebar }: TabBarProps) {
   const appWindow = getCurrentWindow();
   const highlightPath = hoveredProjectPath || linkedProjectPath || selectedProject?.path || null;
   const [dropdown, setDropdown] = useState<{ rect: DOMRect; el: HTMLElement } | null>(null);
@@ -358,7 +360,9 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
             const isRawShell = tab.shellMode === "raw";
             const displayTitle = isRawShell ? (projectDisplayName || tab.title) : tab.title;
             const displaySubtitle = isRawShell ? tab.title : projectDisplayName;
-            const tooltipText = displaySubtitle ? `${displayTitle} — ${displaySubtitle}` : displayTitle;
+            const servers = devServersByTab.get(tab.id);
+            const serversText = servers ? ` · running: ${servers.map(s => `localhost:${s.port}`).join(", ")}` : "";
+            const tooltipText = (displaySubtitle ? `${displayTitle} — ${displaySubtitle}` : displayTitle) + serversText;
             return (
               <div key={tab.id} data-idx={i} data-drag-id={tab.id} className={`tab-item ${tab.id === activeTabId ? "active" : ""} ${isClosing ? "tab-closing" : ""} ${isRawShell ? "tab-raw-shell" : `tab-agent-${tab.agent || "claude"}`} ${isDragging ? "tab-dragging" : ""}`} onPointerDown={(e) => onEntryPointerDown(e, i)} onClick={() => { if (!isClosing) onSelectTab(tab.id); }} onMouseEnter={(e) => setTooltip({ text: tooltipText, rect: e.currentTarget.getBoundingClientRect() })} onMouseLeave={() => setTooltip(null)}>
                 {showDropBefore && <div className="tab-drop-line tab-drop-line-before" />}
@@ -371,6 +375,7 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
                   <span className="tab-item-title truncate">{displayTitle}</span>
                   {displaySubtitle && <span className="tab-item-project">{displaySubtitle}</span>}
                 </div>
+                {servers && <span className="tab-devserver-dot" />}
                 <div className="tab-item-close" onClick={(e) => { e.stopPropagation(); onCloseTab(tab.id); }}>
                   <X size={11} />
                 </div>
