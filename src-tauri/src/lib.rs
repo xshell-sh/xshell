@@ -131,6 +131,7 @@ fn system_time_to_iso(time: SystemTime) -> String {
 // changes (cost/rate-limit refresh). Active sessions still re-parse on every tick — those
 // are 1-2 files. Idle sessions cost only two stat() calls. Drops the title-sync poll cost
 // from "parse every JSONL in the project every 5s" (tens of MB) to a few syscalls.
+#[derive(Serialize, Deserialize)]
 struct SessionCacheEntry {
     jsonl_mtime: SystemTime,
     stats_mtime: Option<SystemTime>,
@@ -138,9 +139,112 @@ struct SessionCacheEntry {
     info: SessionInfo,
 }
 
+static CLAUDE_SESSION_CACHE: OnceLock<Mutex<HashMap<PathBuf, SessionCacheEntry>>> = OnceLock::new();
+
 fn session_cache() -> &'static Mutex<HashMap<PathBuf, SessionCacheEntry>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, SessionCacheEntry>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    ensure_disk_cache_loaded();
+    CLAUDE_SESSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// Parse caches for the non-Claude agents. Their listings used to re-parse everything on every
+// call (a heavy Codex user has tens of thousands of rollouts, ~1 GB), and get_sessions runs
+// per project every few seconds. Each entry is keyed by a fingerprint (mtime + size) of the
+// files the parse reads; None results are cached too, so stubs aren't re-read either.
+type Fingerprint = Vec<(Option<SystemTime>, u64)>;
+type ParseCache<T> = OnceLock<Mutex<HashMap<PathBuf, (Fingerprint, T)>>>;
+
+fn fingerprint(paths: &[PathBuf]) -> Fingerprint {
+    paths.iter().map(|p| fs::metadata(p).map(|m| (m.modified().ok(), m.len())).unwrap_or((None, 0))).collect()
+}
+
+// Look up `key` in `cache`; re-parse when the fingerprint changed. `read` runs against the
+// cached value under the lock so callers can filter before cloning. The lock is not held
+// while parsing, so a slow parse never blocks other lookups.
+fn with_cached<T, R>(cache: &'static ParseCache<T>, key: &std::path::Path, fp: Fingerprint, parse: impl FnOnce() -> T, read: impl FnOnce(&T) -> R) -> R {
+    let map = cache.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let guard = map.lock().unwrap();
+        if let Some((cached_fp, value)) = guard.get(key) {
+            if *cached_fp == fp { return read(value); }
+        }
+    }
+    let value = parse();
+    let out = read(&value);
+    map.lock().unwrap().insert(key.to_path_buf(), (fp, value));
+    DISK_CACHE_DIRTY.store(true, Ordering::Relaxed);
+    out
+}
+
+// ── Persistent parse cache ─────────────────────────────────────────────
+// The Claude and Codex parse caches are saved to disk so a restart doesn't re-parse every
+// session file (a heavy Codex user has ~1 GB of rollouts). Entries are still validated by
+// their fingerprints/mtimes on use, so stale data is never served. Bump DISK_CACHE_VERSION
+// whenever parsing output changes (e.g. title rules), which discards older cache files.
+const DISK_CACHE_VERSION: u32 = 1;
+const DISK_CACHE_SAVE_GAP: Duration = Duration::from_secs(60);
+static CODEX_CWD_CACHE: ParseCache<Option<String>> = OnceLock::new();
+static DISK_CACHE_DIRTY: AtomicBool = AtomicBool::new(false);
+static DISK_CACHE_SAVING: AtomicBool = AtomicBool::new(false);
+static DISK_CACHE_LAST_SAVE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+#[derive(Serialize, Deserialize)]
+struct DiskCache {
+    version: u32,
+    claude: Vec<(PathBuf, SessionCacheEntry)>,
+    codex: Vec<(PathBuf, Fingerprint, Option<SessionInfo>)>,
+    codex_cwd: Vec<(PathBuf, Fingerprint, Option<String>)>,
+}
+
+fn disk_cache_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|d| d.join("com.xshell.app").join("session-cache.json"))
+}
+
+// Seeds the in-memory caches from disk on first use. Every cache accessor calls this before
+// touching its cache, so the disk data is in place before anything is parsed.
+fn ensure_disk_cache_loaded() {
+    static LOADED: OnceLock<()> = OnceLock::new();
+    LOADED.get_or_init(|| {
+        let Some(path) = disk_cache_path() else { return };
+        let Ok(file) = fs::File::open(&path) else { return };
+        let Ok(disk) = serde_json::from_reader::<_, DiskCache>(BufReader::new(file)) else { return };
+        if disk.version != DISK_CACHE_VERSION { return; }
+        let _ = CLAUDE_SESSION_CACHE.set(Mutex::new(disk.claude.into_iter().collect()));
+        let _ = CODEX_SESSION_CACHE.set(Mutex::new(disk.codex.into_iter().map(|(p, fp, v)| (p, (fp, v))).collect()));
+        let _ = CODEX_CWD_CACHE.set(Mutex::new(disk.codex_cwd.into_iter().map(|(p, fp, v)| (p, (fp, v))).collect()));
+    });
+}
+
+// Saves the caches in a background thread when something changed, at most once per
+// DISK_CACHE_SAVE_GAP. Entries for files that no longer exist are dropped. Written to a temp
+// file and renamed, so a crash mid-write never leaves a truncated cache.
+fn schedule_disk_cache_save() {
+    if !DISK_CACHE_DIRTY.load(Ordering::Relaxed) { return; }
+    if DISK_CACHE_LAST_SAVE.lock().unwrap().map_or(false, |at| at.elapsed() < DISK_CACHE_SAVE_GAP) { return; }
+    if DISK_CACHE_SAVING.swap(true, Ordering::AcqRel) { return; }
+    DISK_CACHE_DIRTY.store(false, Ordering::Relaxed);
+    *DISK_CACHE_LAST_SAVE.lock().unwrap() = Some(std::time::Instant::now());
+    std::thread::spawn(|| {
+        let claude: Vec<(PathBuf, SessionCacheEntry)> = CLAUDE_SESSION_CACHE.get().map(|m| m.lock().unwrap().iter()
+            .map(|(p, e)| (p.clone(), SessionCacheEntry { jsonl_mtime: e.jsonl_mtime, stats_mtime: e.stats_mtime, project_path: e.project_path.clone(), info: e.info.clone() }))
+            .collect()).unwrap_or_default();
+        let codex: Vec<(PathBuf, Fingerprint, Option<SessionInfo>)> = CODEX_SESSION_CACHE.get().map(|m| m.lock().unwrap().iter()
+            .map(|(p, (fp, v))| (p.clone(), fp.clone(), v.clone())).collect()).unwrap_or_default();
+        let codex_cwd: Vec<(PathBuf, Fingerprint, Option<String>)> = CODEX_CWD_CACHE.get().map(|m| m.lock().unwrap().iter()
+            .map(|(p, (fp, v))| (p.clone(), fp.clone(), v.clone())).collect()).unwrap_or_default();
+        let disk = DiskCache {
+            version: DISK_CACHE_VERSION,
+            claude: claude.into_iter().filter(|(p, _)| p.exists()).collect(),
+            codex: codex.into_iter().filter(|(p, _, _)| p.exists()).collect(),
+            codex_cwd: codex_cwd.into_iter().filter(|(p, _, _)| p.exists()).collect(),
+        };
+        if let Some(path) = disk_cache_path() {
+            let tmp = path.with_extension("json.tmp");
+            let written = path.parent().map_or(false, |d| fs::create_dir_all(d).is_ok())
+                && fs::File::create(&tmp).ok().map_or(false, |f| serde_json::to_writer(std::io::BufWriter::new(f), &disk).is_ok());
+            if written { let _ = fs::rename(&tmp, &path); } else { let _ = fs::remove_file(&tmp); }
+        }
+        DISK_CACHE_SAVING.store(false, Ordering::Release);
+    });
 }
 
 fn stats_path_for(session_id: &str) -> Option<PathBuf> {
@@ -420,6 +524,7 @@ fn parse_session(path: &std::path::Path, project_name: &str, project_path: &str)
     let info = SessionInfo { id: session_id, title: display_title, timestamp, message_count, project_name: project_name.to_string(), project_path: project_path.to_string(), git_branch, claude_version, tool_use_count, duration_ms, model: model_out, context_tokens, context_limit, cost_usd, is_authoritative_stats, daily_cost, rate_limit_5h_pct, rate_limit_7d_pct, total_input_tokens, total_cache_creation_tokens, total_cache_read_tokens, total_output_tokens, daily_tokens, agent: "claude".into() };
     if let Ok(mut cache) = session_cache().lock() {
         cache.insert(path.to_path_buf(), SessionCacheEntry { jsonl_mtime: modified, stats_mtime, project_path: project_path.to_string(), info: info.clone() });
+        DISK_CACHE_DIRTY.store(true, Ordering::Relaxed);
     }
     Some(info)
 }
@@ -433,18 +538,104 @@ fn parse_session(path: &std::path::Path, project_name: &str, project_path: &str)
 // subscription plans have no per-use cost — while is_authoritative_stats is true so the
 // context bar renders: the numbers come from Codex itself, not an estimate.
 
-fn codex_rollout_files() -> Vec<std::path::PathBuf> {
-    let Some(home) = dirs::home_dir() else { return vec![] };
+// Codex rollout index, kept current from file-watcher events so a refresh doesn't re-list
+// tens of thousands of files. Only used while the watcher covers ~/.codex/sessions
+// (CODEX_INDEX_LIVE); `None` means "do a full walk next time" (startup, watcher overflow,
+// or a directory-level change). Changed rollout paths queue in CODEX_INDEX_PENDING and are
+// re-stat'ed on the next listing.
+static CODEX_INDEX_LIVE: AtomicBool = AtomicBool::new(false);
+static CODEX_INDEX: Mutex<Option<HashMap<PathBuf, Fingerprint>>> = Mutex::new(None);
+static CODEX_INDEX_PENDING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+fn codex_sessions_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".codex").join("sessions"))
+}
+
+// Called by the watcher for every changed path under ~/.codex/sessions.
+fn codex_index_note_change(path: &std::path::Path, need_rescan: bool) {
+    match path.extension() {
+        Some(ext) if ext == "jsonl" && !need_rescan => CODEX_INDEX_PENDING.lock().unwrap().push(path.to_path_buf()),
+        // Other files (temp files etc.) don't affect the index.
+        Some(_) if !need_rescan => {}
+        // No extension: a date directory was created/renamed/removed — or events were lost.
+        // Rebuild from scratch.
+        _ => *CODEX_INDEX.lock().unwrap() = None,
+    }
+}
+
+// Every rollout file with its fingerprint: from the live index when the watcher keeps it
+// current, otherwise a full directory walk.
+fn codex_rollout_files() -> Vec<(PathBuf, Fingerprint)> {
+    if !CODEX_INDEX_LIVE.load(Ordering::Acquire) { return codex_rollout_walk(); }
+    let mut index = CODEX_INDEX.lock().unwrap();
+    let pending: Vec<PathBuf> = std::mem::take(&mut *CODEX_INDEX_PENDING.lock().unwrap());
+    match index.as_mut() {
+        None => { *index = Some(codex_rollout_walk().into_iter().collect()); }
+        Some(map) => {
+            for p in pending {
+                match fs::metadata(&p) {
+                    Ok(m) if m.is_file() => { map.insert(p, vec![(m.modified().ok(), m.len())]); }
+                    _ => { map.remove(&p); }
+                }
+            }
+        }
+    }
+    let out: Vec<(PathBuf, Fingerprint)> = index.as_ref().map(|m| m.iter().map(|(p, fp)| (p.clone(), fp.clone())).collect()).unwrap_or_default();
+    out
+}
+
+// Full walk. The fingerprint comes from the directory entry's metadata, which on Windows is
+// part of the directory listing (no extra syscall per file).
+fn codex_rollout_walk() -> Vec<(PathBuf, Fingerprint)> {
+    let Some(root) = codex_sessions_dir() else { return vec![] };
     let mut files = vec![];
-    let mut stack = vec![home.join(".codex").join("sessions")];
+    let mut stack = vec![root];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).ok().into_iter().flatten().flatten() {
             let p = entry.path();
             if entry.file_type().map_or(false, |ft| ft.is_dir()) { stack.push(p); continue; }
-            if p.extension().map_or(false, |ext| ext == "jsonl") { files.push(p); }
+            if p.extension().map_or(false, |ext| ext == "jsonl") {
+                let fp = entry.metadata().map(|m| vec![(m.modified().ok(), m.len())]).unwrap_or_default();
+                files.push((p, fp));
+            }
         }
     }
     files
+}
+
+static CODEX_SESSION_CACHE: ParseCache<Option<SessionInfo>> = OnceLock::new();
+
+// All Codex sessions passing `keep`, parsed through the cache in one pass: the cache lock is
+// taken once for the whole listing (not per file) and only sessions that pass `keep` are
+// cloned out. The cache holds parses without the rename overlay (title = first prompt or
+// bare id); the user's rename is applied afterwards, matching the original precedence.
+fn codex_sessions(names: &HashMap<String, String>, mut keep: impl FnMut(&SessionInfo) -> bool) -> Vec<SessionInfo> {
+    ensure_disk_cache_loaded();
+    let files = codex_rollout_files();
+    let cache = CODEX_SESSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut out: Vec<SessionInfo> = vec![];
+    let mut misses: Vec<(PathBuf, Fingerprint)> = vec![];
+    {
+        let guard = cache.lock().unwrap();
+        for (p, fp) in files {
+            match guard.get(&p) {
+                Some((cached_fp, parsed)) if *cached_fp == fp => {
+                    if let Some(s) = parsed { if keep(s) { out.push(s.clone()); } }
+                }
+                _ => misses.push((p, fp)),
+            }
+        }
+    }
+    for (p, fp) in misses {
+        let parsed = parse_codex_session(&p, &HashMap::new());
+        if let Some(s) = &parsed { if keep(s) { out.push(s.clone()); } }
+        cache.lock().unwrap().insert(p, (fp, parsed));
+        DISK_CACHE_DIRTY.store(true, Ordering::Relaxed);
+    }
+    for s in &mut out {
+        if let Some(name) = names.get(&s.id) { s.title = name.clone(); }
+    }
+    out
 }
 
 // User-assigned session names (Codex's rename feature) don't live in the rollout files —
@@ -561,7 +752,6 @@ fn parse_codex_session(path: &std::path::Path, names: &HashMap<String, String>) 
 
 // ── Commands ───────────────────────────────────────────────────────────
 
-#[tauri::command]
 fn list_claude_projects() -> Vec<ProjectInfo> {
     let projects_dir = match get_claude_projects_dir() {
         Some(d) if d.exists() => d,
@@ -623,70 +813,84 @@ fn list_claude_projects() -> Vec<ProjectInfo> {
     projects
 }
 
-#[tauri::command]
 fn get_sessions(encoded_name: String) -> Vec<SessionInfo> {
-    let mut sessions: Vec<SessionInfo> = vec![];
+    get_sessions_multi(&[encoded_name.clone()]).remove(&encoded_name).unwrap_or_default()
+}
 
-    // Claude sessions live under ~/.claude/projects/<encoded_name>/. A project can be
-    // Codex-only (no such directory) — that must not short-circuit the Codex pass below.
-    if let Some(project_dir) = get_claude_projects_dir().map(|d| d.join(&encoded_name)) {
-        if project_dir.exists() {
-            // Get project path from first JSONL
-            let mut project_path = String::new();
-            let mut project_name = String::new();
-            for e in fs::read_dir(&project_dir).ok().into_iter().flatten().flatten() {
-                let p = e.path();
-                if p.extension().map_or(true, |ext| ext != "jsonl") { continue; }
-                if let Ok(file) = fs::File::open(&p) {
-                    for line in BufReader::new(file).lines().take(30).flatten() {
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
-                            if let Some(c) = json.get("cwd").and_then(|c| c.as_str()) {
-                                project_path = c.to_string();
-                                project_name = std::path::Path::new(c).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                                break;
+// Sessions for several projects in one pass, keyed by encoded project name. The non-Claude
+// agents have no per-project storage, so each of their listings is walked once here and
+// routed by encoded cwd — instead of once per project.
+fn get_sessions_multi(encoded_names: &[String]) -> HashMap<String, Vec<SessionInfo>> {
+    let mut out: HashMap<String, Vec<SessionInfo>> = encoded_names.iter().map(|n| (n.clone(), vec![])).collect();
+
+    for encoded_name in encoded_names {
+        // Claude sessions live under ~/.claude/projects/<encoded_name>/. A project can be
+        // Codex-only (no such directory) — that must not short-circuit the Codex pass below.
+        if let Some(project_dir) = get_claude_projects_dir().map(|d| d.join(encoded_name)) {
+            if project_dir.exists() {
+                // Get project path from first JSONL
+                let mut project_path = String::new();
+                let mut project_name = String::new();
+                for e in fs::read_dir(&project_dir).ok().into_iter().flatten().flatten() {
+                    let p = e.path();
+                    if p.extension().map_or(true, |ext| ext != "jsonl") { continue; }
+                    if let Ok(file) = fs::File::open(&p) {
+                        for line in BufReader::new(file).lines().take(30).flatten() {
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                                if let Some(c) = json.get("cwd").and_then(|c| c.as_str()) {
+                                    project_path = c.to_string();
+                                    project_name = std::path::Path::new(c).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                                    break;
+                                }
                             }
                         }
                     }
+                    if !project_path.is_empty() { break; }
                 }
-                if !project_path.is_empty() { break; }
-            }
 
-            sessions.extend(fs::read_dir(&project_dir).ok().into_iter().flatten().flatten().filter_map(|e| {
-                let p = e.path();
-                if p.extension().map_or(true, |ext| ext != "jsonl") { return None; }
-                parse_session(&p, &project_name, &project_path)
-            }));
+                out.entry(encoded_name.clone()).or_default().extend(fs::read_dir(&project_dir).ok().into_iter().flatten().flatten().filter_map(|e| {
+                    let p = e.path();
+                    if p.extension().map_or(true, |ext| ext != "jsonl") { return None; }
+                    parse_session(&p, &project_name, &project_path)
+                }));
+            }
         }
     }
 
     // Codex sessions have no per-project directory — match rollouts whose recorded cwd
     // encodes to the same project directory name Claude would use.
+    // Encoding is memoized per distinct cwd: tens of thousands of rollouts share a few
+    // dozen directories.
     let codex_names = codex_session_names();
-    for p in codex_rollout_files() {
-        if let Some(s) = parse_codex_session(&p, &codex_names) {
-            if encode_project_name(&s.project_path) == encoded_name { sessions.push(s); }
-        }
+    let mut target_of: HashMap<String, Option<String>> = HashMap::new();
+    let codex = codex_sessions(&codex_names, |s| {
+        target_of.entry(s.project_path.clone()).or_insert_with(|| {
+            let enc = encode_project_name(&s.project_path);
+            out.contains_key(&enc).then_some(enc)
+        }).is_some()
+    });
+    for s in codex {
+        if let Some(Some(enc)) = target_of.get(&s.project_path) { out.get_mut(enc).unwrap().push(s); }
     }
 
-    // Cursor chats — same approach: resolve each chat's cwd, then match by encoded name.
-    let cursor_ws = cursor_workspace_map();
-    for dir in cursor_chat_dirs() {
-        if let Some(s) = parse_cursor_session(&dir, &cursor_ws) {
-            if !s.project_path.is_empty() && encode_project_name(&s.project_path) == encoded_name { sessions.push(s); }
-        }
+    // Cursor chats, opencode sessions, Antigravity conversations — each records its cwd;
+    // route by encoded name. Cursor chats with an unresolved workspace have an empty cwd.
+    let others = parse_cursor_sessions().into_iter().filter(|s| !s.project_path.is_empty())
+        .chain(parse_opencode_sessions())
+        .chain(parse_antigravity_sessions());
+    for s in others {
+        if let Some(list) = out.get_mut(&encode_project_name(&s.project_path)) { list.push(s); }
     }
 
-    // opencode sessions — each row records its cwd directly; match by encoded name.
-    sessions.extend(parse_opencode_sessions().into_iter().filter(|s| encode_project_name(&s.project_path) == encoded_name));
-
-    // Antigravity conversations — workspace-scoped by design; match by encoded name.
-    sessions.extend(parse_antigravity_sessions().into_iter().filter(|s| encode_project_name(&s.project_path) == encoded_name));
-
-    sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-    sessions
+    schedule_disk_cache_save();
+    for list in out.values_mut() { list.sort_by(|a, b| b.timestamp.cmp(&a.timestamp)); }
+    out
 }
 
-#[tauri::command]
+fn get_sessions_for_projects(encoded_names: Vec<String>) -> HashMap<String, Vec<SessionInfo>> {
+    get_sessions_multi(&encoded_names)
+}
+
 fn get_all_recent_sessions(limit: usize) -> Vec<SessionInfo> {
     let mut all_sessions: Vec<SessionInfo> = vec![];
 
@@ -731,11 +935,10 @@ fn get_all_recent_sessions(limit: usize) -> Vec<SessionInfo> {
 
     // Codex sessions across all directories — same recency pool as the Claude ones.
     let codex_names = codex_session_names();
-    all_sessions.extend(codex_rollout_files().iter().filter_map(|p| parse_codex_session(p, &codex_names)));
+    all_sessions.extend(codex_sessions(&codex_names, |_| true));
 
     // Cursor chats across all workspaces — same recency pool.
-    let cursor_ws = cursor_workspace_map();
-    all_sessions.extend(cursor_chat_dirs().iter().filter_map(|d| parse_cursor_session(d, &cursor_ws)));
+    all_sessions.extend(parse_cursor_sessions());
 
     // opencode sessions across all directories — same recency pool.
     all_sessions.extend(parse_opencode_sessions());
@@ -743,6 +946,7 @@ fn get_all_recent_sessions(limit: usize) -> Vec<SessionInfo> {
     // Antigravity conversations across all workspaces — same recency pool.
     all_sessions.extend(parse_antigravity_sessions());
 
+    schedule_disk_cache_save();
     all_sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     all_sessions.truncate(limit);
     all_sessions
@@ -756,7 +960,6 @@ pub struct MessagePreview {
     pub text: String,
 }
 
-#[tauri::command]
 fn get_session_messages(encoded_name: String, session_id: String, limit: usize) -> Vec<MessagePreview> {
     let projects_dir = match get_claude_projects_dir() { Some(d) => d, None => return vec![] };
     let path = projects_dir.join(&encoded_name).join(format!("{}.jsonl", session_id));
@@ -788,12 +991,10 @@ fn get_session_messages(encoded_name: String, session_id: String, limit: usize) 
 
 // ── Image Helper ──────────────────────────────────────────────────────
 
-#[tauri::command]
 fn read_text_file(path: String) -> Result<String, String> {
     fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {}", e))
 }
 
-#[tauri::command]
 fn read_image_base64(path: String) -> Result<String, String> {
     let data = fs::read(&path).map_err(|e| format!("Failed to read image: {}", e))?;
     let ext = std::path::Path::new(&path).extension().and_then(|e| e.to_str()).unwrap_or("png").to_lowercase();
@@ -847,7 +1048,6 @@ const MAX_DROPPED_FILE_BYTES: usize = 25 * 1024 * 1024; // ponytail: flat cap, r
 // a native app) never gives us a real filesystem path for either one, so we save the bytes to
 // a real temp file and hand back that path instead, since shells/CLIs take a path, not raw bytes.
 // Bytes travel as base64 (not a JSON number array) to keep the IPC payload small.
-#[tauri::command]
 fn save_dropped_file(bytes_base64: String, name: String) -> Result<String, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
     let bytes = decode_base64(&bytes_base64);
@@ -1187,7 +1387,6 @@ fn parse_plugin_key(key: &str) -> (String, Option<String>) {
     }
 }
 
-#[tauri::command]
 fn get_project_skills(project_path: String) -> ProjectSkills {
     let empty = || ProjectSkills { personal_skills: vec![], project_skills: vec![], plugins: vec![], user_mcps: vec![], project_mcps: vec![], subagents: vec![], slash_commands: vec![], hooks: vec![], claude_md_files: vec![], settings_sources: vec![] };
     let home = match dirs::home_dir() { Some(h) => h, None => return empty() };
@@ -1345,7 +1544,6 @@ fn find_git_root(start: &std::path::Path) -> Option<PathBuf> {
 // All worktrees/subdirs within the same repo share one memory folder; outside a repo the
 // project path itself is used. Each .md has YAML frontmatter (name/description/type);
 // MEMORY.md is the index and is skipped.
-#[tauri::command]
 fn get_project_memories(project_path: String) -> ProjectMemories {
     let projects_root = match get_claude_projects_dir() {
         Some(d) => d,
@@ -1695,7 +1893,6 @@ async fn git_diff(cwd: String, path: String, mode: String) -> Result<String, Str
     else { Err(String::from_utf8_lossy(&out.stderr).into_owned()) }
 }
 
-#[tauri::command]
 fn git_stage(cwd: String, paths: Vec<String>) -> Result<(), String> {
     if paths.is_empty() { return Ok(()); }
     let mut cmd = git_cmd(&git_root(&cwd)); // root-relative paths from status; run from the top-level
@@ -1732,7 +1929,6 @@ fn read_forked_from(path: &std::path::Path) -> Option<String> {
     None
 }
 
-#[tauri::command]
 fn list_project_session_ids(cwd: String) -> Vec<String> {
     let projects_dir = match get_claude_projects_dir() { Some(d) => d, None => return vec![] };
     let project_dir = projects_dir.join(encode_project_name(&cwd));
@@ -1750,7 +1946,6 @@ fn list_project_session_ids(cwd: String) -> Vec<String> {
     out
 }
 
-#[tauri::command]
 fn detect_session_branch(cwd: String, current_session_id: String, known_session_ids: Vec<String>) -> Option<BranchInfo> {
     // Project dir derivation mirrors how Claude Code encodes paths (slashes/backslashes/colons → dashes).
     let projects_dir = get_claude_projects_dir()?;
@@ -1786,7 +1981,6 @@ fn detect_session_branch(cwd: String, current_session_id: String, known_session_
     None
 }
 
-#[tauri::command]
 fn git_unstage(cwd: String, paths: Vec<String>) -> Result<(), String> {
     if paths.is_empty() { return Ok(()); }
     let mut cmd = git_cmd(&git_root(&cwd)); // root-relative paths from status; run from the top-level
@@ -1841,7 +2035,6 @@ pub struct GitBranch {
     pub last_commit_relative: String,
 }
 
-#[tauri::command]
 fn list_git_branches(cwd: String) -> Vec<GitBranch> {
     // ASCII unit-separator (\x1f) between fields keeps subjects with spaces / tabs intact.
     // Sorted by committer date desc so the dropdown opens with the most-relevant branches up
@@ -1870,7 +2063,6 @@ fn list_git_branches(cwd: String) -> Vec<GitBranch> {
     branches
 }
 
-#[tauri::command]
 fn git_checkout(cwd: String, branch: String) -> Result<(), String> {
     // For remote refs we hand `git switch` the bare branch name (e.g. "feature/foo" not
     // "origin/feature/foo"). Since git 2.23, `switch <name>` does DWIM: if no local branch
@@ -2208,7 +2400,6 @@ pub struct StatuslineProbe {
     pub stats_dir_path: String,
 }
 
-#[tauri::command]
 fn probe_statusline_setup() -> StatuslineProbe {
     let home = dirs::home_dir().unwrap_or_default();
     let stats_dir = home.join(".claude").join("xshell-stats");
@@ -2266,7 +2457,6 @@ pub struct GlobalRateLimits {
     pub source_session_id: Option<String>,
 }
 
-#[tauri::command]
 fn get_global_rate_limits() -> GlobalRateLimits {
     let mut out = GlobalRateLimits {
         five_hour_pct: None, seven_day_pct: None,
@@ -2339,7 +2529,6 @@ pub struct CodexContext {
     pub sections: Vec<AgentContextSection>,
 }
 
-#[tauri::command]
 fn get_codex_context(project_path: String) -> CodexContext {
     let home = dirs::home_dir();
     let mut sections: Vec<AgentContextSection> = vec![];
@@ -2423,7 +2612,6 @@ pub struct CursorContext {
     pub sections: Vec<AgentContextSection>,
 }
 
-#[tauri::command]
 fn get_cursor_context(project_path: String) -> CursorContext {
     let pp = std::path::Path::new(&project_path);
     let mut sections: Vec<AgentContextSection> = vec![];
@@ -2495,7 +2683,6 @@ pub struct ClaudeCostSummary {
     pub daily: Vec<DailyUsd>, // ascending by date; today/this-week math happens client-side
 }
 
-#[tauri::command]
 fn get_claude_cost_summary() -> ClaudeCostSummary {
     let Some(home) = dirs::home_dir() else { return ClaudeCostSummary { connected: false, daily: vec![] } };
     let stats_dir = home.join(".claude").join("xshell-stats");
@@ -2544,7 +2731,6 @@ pub struct CodexUsage {
     pub daily_sessions: Vec<DailySessionCount>,
 }
 
-#[tauri::command]
 fn get_codex_usage() -> CodexUsage {
     let mut out = CodexUsage { present: false, primary: None, secondary: None, plan_type: None, rate_limits_updated_iso: None, daily_sessions: vec![] };
     let Some(home) = dirs::home_dir() else { return out };
@@ -2616,39 +2802,33 @@ pub struct CodexProjectInfo {
     pub last_active: String,
 }
 
-#[tauri::command]
 fn list_codex_projects() -> Vec<CodexProjectInfo> {
     let Some(home) = dirs::home_dir() else { return vec![] };
     let sessions_dir = home.join(".codex").join("sessions");
     if !sessions_dir.exists() { return vec![]; }
 
+    // cwd per rollout (first line only), cached by fingerprint like the full session parse.
+    ensure_disk_cache_loaded();
     let mut by_cwd: HashMap<String, (usize, Option<SystemTime>)> = HashMap::new();
-    let mut stack = vec![sessions_dir];
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir).ok().into_iter().flatten().flatten() {
-            let p = entry.path();
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) { stack.push(p); continue; }
-            if p.extension().map_or(true, |ext| ext != "jsonl") { continue; }
+    for (p, fp) in codex_rollout_files() {
+        let modified = fp.first().and_then(|(m, _)| *m);
+        let cwd = with_cached(&CODEX_CWD_CACHE, &p, fp, || {
+            let file = fs::File::open(&p).ok()?;
+            let mut first = String::new();
+            BufReader::new(file).read_line(&mut first).ok()?;
+            let json = serde_json::from_str::<serde_json::Value>(&first).ok()?;
+            json.get("payload").and_then(|pl| pl.get("cwd")).and_then(|c| c.as_str()).map(|s| s.to_string())
+        }, |c| c.clone());
+        let Some(cwd) = cwd else { continue };
 
-            let mut cwd: Option<String> = None;
-            if let Ok(file) = fs::File::open(&p) {
-                let mut first = String::new();
-                if BufReader::new(file).read_line(&mut first).is_ok() {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&first) {
-                        cwd = json.get("payload").and_then(|pl| pl.get("cwd")).and_then(|c| c.as_str()).map(|s| s.to_string());
-                    }
-                }
-            }
-            let Some(cwd) = cwd else { continue };
-
-            let slot = by_cwd.entry(cwd).or_insert((0, None));
-            slot.0 += 1;
-            if let Some(modified) = fs::metadata(&p).ok().and_then(|m| m.modified().ok()) {
-                if slot.1.map_or(true, |prev| modified > prev) { slot.1 = Some(modified); }
-            }
+        let slot = by_cwd.entry(cwd).or_insert((0, None));
+        slot.0 += 1;
+        if let Some(modified) = modified {
+            if slot.1.map_or(true, |prev| modified > prev) { slot.1 = Some(modified); }
         }
     }
 
+    schedule_disk_cache_save();
     let mut projects: Vec<CodexProjectInfo> = by_cwd.into_iter()
         .map(|(path, (session_count, latest))| CodexProjectInfo { path, session_count, last_active: latest.map(system_time_to_iso).unwrap_or_default() })
         .collect();
@@ -2737,23 +2917,48 @@ fn parse_cursor_session(chat_dir: &std::path::Path, ws_map: &HashMap<String, Str
 
 // Directories Cursor has been used in — for the Add Projects picker's per-agent marks.
 // Same shape as the Claude/Codex project lists; grouped by each chat's resolved cwd.
-#[tauri::command]
 fn list_cursor_projects() -> Vec<CodexProjectInfo> {
-    let ws = cursor_workspace_map();
     let mut by_cwd: HashMap<String, (usize, String)> = HashMap::new();
-    for dir in cursor_chat_dirs() {
-        if let Some(s) = parse_cursor_session(&dir, &ws) {
-            if s.project_path.is_empty() { continue; }
-            let slot = by_cwd.entry(s.project_path).or_insert((0, String::new()));
-            slot.0 += 1;
-            if s.timestamp > slot.1 { slot.1 = s.timestamp; }
-        }
+    for s in parse_cursor_sessions() {
+        if s.project_path.is_empty() { continue; }
+        let slot = by_cwd.entry(s.project_path).or_insert((0, String::new()));
+        slot.0 += 1;
+        if s.timestamp > slot.1 { slot.1 = s.timestamp; }
     }
     let mut projects: Vec<CodexProjectInfo> = by_cwd.into_iter()
         .map(|(path, (session_count, last_active))| CodexProjectInfo { path, session_count, last_active })
         .collect();
     projects.sort_by(|a, b| b.last_active.cmp(&a.last_active));
     projects
+}
+
+// All Cursor chats, parsed through a per-chat cache. The workspace map is only built when
+// there are chats to resolve (it lists every Claude and Codex project), and is reused for
+// 30 s — a brand-new workspace resolves within that window.
+fn parse_cursor_sessions() -> Vec<SessionInfo> {
+    static WS_MAP: OnceLock<Mutex<Option<(SystemTime, HashMap<String, String>)>>> = OnceLock::new();
+    static CHAT_CACHE: ParseCache<Option<SessionInfo>> = OnceLock::new();
+
+    let dirs = cursor_chat_dirs();
+    if dirs.is_empty() { return vec![]; }
+    let ws = {
+        let mut slot = WS_MAP.get_or_init(|| Mutex::new(None)).lock().unwrap();
+        let fresh = slot.as_ref().map_or(false, |(at, _)| at.elapsed().map_or(false, |age| age < Duration::from_secs(30)));
+        if !fresh { *slot = Some((SystemTime::now(), cursor_workspace_map())); }
+        slot.as_ref().unwrap().1.clone()
+    };
+
+    dirs.iter().filter_map(|dir| {
+        let fp = fingerprint(&[dir.join("meta.json"), dir.join("store.db"), dir.join("store.db-wal")]);
+        // Cached without the workspace resolution; cwd is overlaid from the current map.
+        let mut s = with_cached(&CHAT_CACHE, dir, fp, || parse_cursor_session(dir, &HashMap::new()), |s| s.clone())?;
+        let hash = dir.parent()?.file_name()?.to_string_lossy().into_owned();
+        if let Some(cwd) = ws.get(&hash) {
+            s.project_name = std::path::Path::new(cwd).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            s.project_path = cwd.clone();
+        }
+        Some(s)
+    }).collect()
 }
 
 // Enumerate ~/.cursor/chats/<hash>/<chat-uuid>/ session directories.
@@ -2807,7 +3012,17 @@ fn opencode_context_limits() -> HashMap<String, u64> {
     map
 }
 
+// Cached: the full parse scans the whole message table, so it only re-runs when the
+// database, its WAL, or the model catalog changed.
 fn parse_opencode_sessions() -> Vec<SessionInfo> {
+    static CACHE: ParseCache<Vec<SessionInfo>> = OnceLock::new();
+    let (Some(data), Some(home)) = (opencode_data_dir(), dirs::home_dir()) else { return vec![] };
+    let db = data.join("opencode.db");
+    let fp = fingerprint(&[db.clone(), data.join("opencode.db-wal"), home.join(".cache").join("opencode").join("models.json")]);
+    with_cached(&CACHE, &db, fp, parse_opencode_sessions_uncached, |v| v.clone())
+}
+
+fn parse_opencode_sessions_uncached() -> Vec<SessionInfo> {
     let Some(conn) = opencode_open_db() else { return vec![] };
     let limits = opencode_context_limits();
 
@@ -2889,7 +3104,6 @@ fn parse_opencode_sessions() -> Vec<SessionInfo> {
 
 // Directories opencode has been used in — for the Add Projects picker's per-agent marks.
 // Grouped from the sessions' recorded directories, same shape as the other agents' lists.
-#[tauri::command]
 fn list_opencode_projects() -> Vec<CodexProjectInfo> {
     let mut by_cwd: HashMap<String, (usize, String)> = HashMap::new();
     for s in parse_opencode_sessions() {
@@ -2957,7 +3171,6 @@ fn opencode_config_files(project_path: &std::path::Path) -> Vec<(PathBuf, &'stat
     files.into_iter().filter(|(p, _)| p.exists()).collect()
 }
 
-#[tauri::command]
 fn get_opencode_context(project_path: String) -> OpencodeContext {
     let pp = std::path::Path::new(&project_path);
     let mut sections: Vec<AgentContextSection> = vec![];
@@ -3156,16 +3369,23 @@ fn parse_antigravity_conversation(path: &std::path::Path, names: &HashMap<String
 
 fn parse_antigravity_sessions() -> Vec<SessionInfo> {
     let Some(dir) = antigravity_data_dir().map(|d| d.join("conversations")) else { return vec![] };
+    // Cached per conversation db (without the name overlay, which is applied afterwards —
+    // same precedence as parse_antigravity_conversation: name > first prompt > bare id).
+    static CACHE: ParseCache<Option<SessionInfo>> = OnceLock::new();
     let names = antigravity_conversation_names();
     fs::read_dir(&dir).ok().into_iter().flatten().flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().map_or(false, |ext| ext == "db"))
-        .filter_map(|p| parse_antigravity_conversation(&p, &names))
+        .filter_map(|p| {
+            let fp = fingerprint(&[p.clone(), p.with_extension("db-wal")]);
+            let mut s = with_cached(&CACHE, &p, fp, || parse_antigravity_conversation(&p, &HashMap::new()), |s| s.clone())?;
+            if let Some(name) = names.get(&s.id) { s.title = name.clone(); }
+            Some(s)
+        })
         .collect()
 }
 
 // Directories Antigravity has been used in — for the Add Projects picker's per-agent marks.
-#[tauri::command]
 fn list_antigravity_projects() -> Vec<CodexProjectInfo> {
     let mut by_cwd: HashMap<String, (usize, String)> = HashMap::new();
     for s in parse_antigravity_sessions() {
@@ -3192,7 +3412,6 @@ pub struct AntigravityContext {
     pub sections: Vec<AgentContextSection>,
 }
 
-#[tauri::command]
 fn get_antigravity_context(project_path: String) -> AntigravityContext {
     let pp = std::path::Path::new(&project_path);
     let home = dirs::home_dir();
@@ -3319,6 +3538,240 @@ async fn detect_agent_binary(binary: String) -> Result<AgentBinaryProbe, String>
 
 // ── App Setup ──────────────────────────────────────────────────────────
 
+// ── Agent data watcher ────────────────────────────────────────────────
+// Watches the directories the agent CLIs write session data to and emits
+// `agent-data-changed` with the agents whose data changed, so the UI refreshes on change
+// instead of polling every few seconds. Bursts (an active session appends many times a
+// second) are throttled to at most one event per AGENT_EVENT_MIN_GAP, with a trailing
+// event so the last change is never dropped. Directories that don't exist at startup are
+// not watched; the UI keeps a slow fallback poll for those.
+const AGENT_EVENT_MIN_GAP: Duration = Duration::from_secs(2);
+
+fn start_agent_data_watcher(app: tauri::AppHandle) {
+    use notify::{RecursiveMode, Watcher};
+    use tauri::Emitter;
+
+    let Some(home) = dirs::home_dir() else { return };
+    // (agent tag, directory, recursive)
+    let targets: Vec<(&'static str, PathBuf, bool)> = vec![
+        ("claude", home.join(".claude").join("projects"), true),
+        ("claude-stats", home.join(".claude").join("xshell-stats"), false),
+        ("codex", home.join(".codex").join("sessions"), true),
+        ("codex", home.join(".codex"), false), // session_index.jsonl (renames)
+        ("cursor", home.join(".cursor").join("chats"), true),
+        ("opencode", home.join(".local").join("share").join("opencode"), false),
+        ("antigravity", home.join(".gemini").join("antigravity-cli"), true),
+    ];
+
+    std::thread::spawn(move || {
+        let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+        let Ok(mut watcher) = notify::recommended_watcher(tx) else { return };
+        let mut watched: Vec<(&'static str, PathBuf)> = vec![];
+        for (tag, dir, recursive) in &targets {
+            if !dir.is_dir() { continue; }
+            let mode = if *recursive { RecursiveMode::Recursive } else { RecursiveMode::NonRecursive };
+            if watcher.watch(dir, mode).is_ok() { watched.push((tag, dir.clone())); }
+        }
+        if watched.is_empty() { return; }
+        // From here on, changes under ~/.codex/sessions reach the Codex index. Reset it so the
+        // next listing walks once and then stays current from events.
+        let codex_dir = codex_sessions_dir();
+        if let Some(dir) = &codex_dir {
+            if watched.iter().any(|(_, d)| d == dir) {
+                *CODEX_INDEX.lock().unwrap() = None;
+                CODEX_INDEX_LIVE.store(true, Ordering::Release);
+                        }
+        }
+
+        // Most specific watched directory wins (~/.codex/sessions over ~/.codex).
+        let tag_for = |path: &std::path::Path| -> Option<&'static str> {
+            watched.iter().filter(|(_, dir)| path.starts_with(dir)).max_by_key(|(_, dir)| dir.as_os_str().len()).map(|(tag, _)| *tag)
+        };
+
+        let mut pending: HashSet<&'static str> = HashSet::new();
+        let mut last_emit: Option<std::time::Instant> = None;
+        loop {
+            let wait = match (pending.is_empty(), last_emit) {
+                (true, _) => Duration::from_secs(3600),
+                (false, Some(at)) => AGENT_EVENT_MIN_GAP.saturating_sub(at.elapsed()),
+                (false, None) => Duration::ZERO,
+            };
+            match rx.recv_timeout(wait) {
+                Ok(Ok(event)) => {
+                    if matches!(event.kind, notify::EventKind::Access(_)) { continue; }
+                    if event.need_rescan() { *CODEX_INDEX.lock().unwrap() = None; }
+                                    for path in &event.paths {
+                        if let Some(dir) = &codex_dir {
+                            if path.starts_with(dir) { codex_index_note_change(path, false); }
+                        }
+                        // SQLite's shared-memory/journal side files change when xshell itself
+                        // reads a database (opencode, Cursor, Antigravity) — reacting to them
+                        // would loop: event → refresh → read → event.
+                        let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                        if name.ends_with("-shm") || name.ends_with("-journal") { continue; }
+                        if let Some(tag) = tag_for(path) { pending.insert(tag); }
+                    }
+                }
+                // A watcher error may mean lost events — rebuild the Codex index next time.
+                Ok(Err(_)) => { *CODEX_INDEX.lock().unwrap() = None; continue; }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+            if !pending.is_empty() && last_emit.map_or(true, |at| at.elapsed() >= AGENT_EVENT_MIN_GAP) {
+                let agents: Vec<&str> = pending.drain().collect();
+                let _ = app.emit("agent-data-changed", agents);
+                last_emit = Some(std::time::Instant::now());
+            }
+        }
+    });
+}
+
+// Heavy commands run on Tauri's blocking thread pool. Sync `#[tauri::command]` fns execute
+// on the main thread, so polling them (session scans, rate limits, branch detection) froze the UI.
+mod bg {
+    use super::*;
+
+    #[tauri::command]
+    pub async fn list_claude_projects() -> Result<Vec<ProjectInfo>, String> {
+        tauri::async_runtime::spawn_blocking(move || super::list_claude_projects()).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn get_sessions_for_projects(encoded_names: Vec<String>) -> Result<HashMap<String, Vec<SessionInfo>>, String> {
+        tauri::async_runtime::spawn_blocking(move || super::get_sessions_for_projects(encoded_names)).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn get_sessions(encoded_name: String) -> Result<Vec<SessionInfo>, String> {
+        tauri::async_runtime::spawn_blocking(move || super::get_sessions(encoded_name)).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn get_all_recent_sessions(limit: usize) -> Result<Vec<SessionInfo>, String> {
+        tauri::async_runtime::spawn_blocking(move || super::get_all_recent_sessions(limit)).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn get_session_messages(encoded_name: String, session_id: String, limit: usize) -> Result<Vec<MessagePreview>, String> {
+        tauri::async_runtime::spawn_blocking(move || super::get_session_messages(encoded_name, session_id, limit)).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn read_image_base64(path: String) -> Result<String, String> {
+        tauri::async_runtime::spawn_blocking(move || super::read_image_base64(path)).await.map_err(|e| e.to_string())?
+    }
+
+    #[tauri::command]
+    pub async fn save_dropped_file(bytes_base64: String, name: String) -> Result<String, String> {
+        tauri::async_runtime::spawn_blocking(move || super::save_dropped_file(bytes_base64, name)).await.map_err(|e| e.to_string())?
+    }
+
+    #[tauri::command]
+    pub async fn read_text_file(path: String) -> Result<String, String> {
+        tauri::async_runtime::spawn_blocking(move || super::read_text_file(path)).await.map_err(|e| e.to_string())?
+    }
+
+    #[tauri::command]
+    pub async fn get_project_skills(project_path: String) -> Result<ProjectSkills, String> {
+        tauri::async_runtime::spawn_blocking(move || super::get_project_skills(project_path)).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn get_project_memories(project_path: String) -> Result<ProjectMemories, String> {
+        tauri::async_runtime::spawn_blocking(move || super::get_project_memories(project_path)).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn git_stage(cwd: String, paths: Vec<String>) -> Result<(), String> {
+        tauri::async_runtime::spawn_blocking(move || super::git_stage(cwd, paths)).await.map_err(|e| e.to_string())?
+    }
+
+    #[tauri::command]
+    pub async fn git_unstage(cwd: String, paths: Vec<String>) -> Result<(), String> {
+        tauri::async_runtime::spawn_blocking(move || super::git_unstage(cwd, paths)).await.map_err(|e| e.to_string())?
+    }
+
+    #[tauri::command]
+    pub async fn list_git_branches(cwd: String) -> Result<Vec<GitBranch>, String> {
+        tauri::async_runtime::spawn_blocking(move || super::list_git_branches(cwd)).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn git_checkout(cwd: String, branch: String) -> Result<(), String> {
+        tauri::async_runtime::spawn_blocking(move || super::git_checkout(cwd, branch)).await.map_err(|e| e.to_string())?
+    }
+
+    #[tauri::command]
+    pub async fn list_project_session_ids(cwd: String) -> Result<Vec<String>, String> {
+        tauri::async_runtime::spawn_blocking(move || super::list_project_session_ids(cwd)).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn detect_session_branch(cwd: String, current_session_id: String, known_session_ids: Vec<String>) -> Result<Option<BranchInfo>, String> {
+        tauri::async_runtime::spawn_blocking(move || super::detect_session_branch(cwd, current_session_id, known_session_ids)).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn probe_statusline_setup() -> Result<StatuslineProbe, String> {
+        tauri::async_runtime::spawn_blocking(move || super::probe_statusline_setup()).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn get_global_rate_limits() -> Result<GlobalRateLimits, String> {
+        tauri::async_runtime::spawn_blocking(move || super::get_global_rate_limits()).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn list_codex_projects() -> Result<Vec<CodexProjectInfo>, String> {
+        tauri::async_runtime::spawn_blocking(move || super::list_codex_projects()).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn list_cursor_projects() -> Result<Vec<CodexProjectInfo>, String> {
+        tauri::async_runtime::spawn_blocking(move || super::list_cursor_projects()).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn list_opencode_projects() -> Result<Vec<CodexProjectInfo>, String> {
+        tauri::async_runtime::spawn_blocking(move || super::list_opencode_projects()).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn list_antigravity_projects() -> Result<Vec<CodexProjectInfo>, String> {
+        tauri::async_runtime::spawn_blocking(move || super::list_antigravity_projects()).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn get_codex_context(project_path: String) -> Result<CodexContext, String> {
+        tauri::async_runtime::spawn_blocking(move || super::get_codex_context(project_path)).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn get_cursor_context(project_path: String) -> Result<CursorContext, String> {
+        tauri::async_runtime::spawn_blocking(move || super::get_cursor_context(project_path)).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn get_opencode_context(project_path: String) -> Result<OpencodeContext, String> {
+        tauri::async_runtime::spawn_blocking(move || super::get_opencode_context(project_path)).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn get_antigravity_context(project_path: String) -> Result<AntigravityContext, String> {
+        tauri::async_runtime::spawn_blocking(move || super::get_antigravity_context(project_path)).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn get_claude_cost_summary() -> Result<ClaudeCostSummary, String> {
+        tauri::async_runtime::spawn_blocking(move || super::get_claude_cost_summary()).await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn get_codex_usage() -> Result<CodexUsage, String> {
+        tauri::async_runtime::spawn_blocking(move || super::get_codex_usage()).await.map_err(|e| e.to_string())
+    }
+}
+
 pub fn run() {
     cleanup_old_dropped_files();
     tauri::Builder::default()
@@ -3327,7 +3780,8 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(AppState { terminals: Mutex::new(HashMap::new()) })
-        .invoke_handler(tauri::generate_handler![list_claude_projects, get_sessions, get_all_recent_sessions, get_session_messages, read_image_base64, save_dropped_file, read_text_file, reveal_in_explorer, list_dir, search_dir, open_url, get_username, get_home_dir, get_project_skills, get_project_memories, get_git_status, get_git_log, git_diff, git_stage, git_unstage, git_discard, list_git_branches, git_checkout, list_project_session_ids, detect_session_branch, probe_statusline_setup, get_global_rate_limits, detect_agent_binary, list_codex_projects, list_cursor_projects, list_opencode_projects, list_antigravity_projects, get_codex_context, get_cursor_context, get_opencode_context, get_antigravity_context, get_claude_cost_summary, get_codex_usage, spawn_terminal, write_terminal, resize_terminal, close_terminal])
+        .setup(|app| { start_agent_data_watcher(app.handle().clone()); Ok(()) })
+        .invoke_handler(tauri::generate_handler![bg::list_claude_projects, bg::get_sessions, bg::get_sessions_for_projects, bg::get_all_recent_sessions, bg::get_session_messages, bg::read_image_base64, bg::save_dropped_file, bg::read_text_file, reveal_in_explorer, list_dir, search_dir, open_url, get_username, get_home_dir, bg::get_project_skills, bg::get_project_memories, get_git_status, get_git_log, git_diff, bg::git_stage, bg::git_unstage, git_discard, bg::list_git_branches, bg::git_checkout, bg::list_project_session_ids, bg::detect_session_branch, bg::probe_statusline_setup, bg::get_global_rate_limits, detect_agent_binary, bg::list_codex_projects, bg::list_cursor_projects, bg::list_opencode_projects, bg::list_antigravity_projects, bg::get_codex_context, bg::get_cursor_context, bg::get_opencode_context, bg::get_antigravity_context, bg::get_claude_cost_summary, bg::get_codex_usage, spawn_terminal, write_terminal, resize_terminal, close_terminal])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

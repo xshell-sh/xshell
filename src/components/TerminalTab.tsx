@@ -16,6 +16,8 @@ import type { Tab, GitStatus, GitFile, GitCommit, BranchInfo, SessionInfo, GitBr
 import { getShellById } from "../shells";
 import { AGENTS } from "../agents";
 import type { ThemeMode } from "./SettingsView";
+import { useAgentDataChanged } from "../hooks/useAgentDataChanged";
+import { useWindowVisible } from "../hooks/useWindowVisible";
 
 const DEFAULT_FONT_SIZE = 14;
 const MIN_FONT_SIZE = 8;
@@ -127,9 +129,21 @@ async function saveZoom(tabId: string, size: number) {
   } catch {}
 }
 
+// Lines of history each terminal keeps in memory (user setting). Agent output is wide and
+// verbose, so this is a real RAM cost per open tab.
+export const DEFAULT_SCROLLBACK = 5000;
+export const MIN_SCROLLBACK = 1000;
+export const MAX_SCROLLBACK = 50000;
+
+// How long a hidden tab keeps its WebGL renderer before releasing it.
+const WEBGL_RELEASE_DELAY_MS = 10000;
+
 interface TerminalTabProps {
   tab: Tab;
   isActive: boolean;
+  // On screen (the active tab, or any pane of the active split group). Hidden tabs release
+  // their WebGL context.
+  isVisible: boolean;
   gitLazyPolling: boolean;
   gitChangesTree: boolean;
   fileExplorerOnStart: boolean;
@@ -147,6 +161,7 @@ interface TerminalTabProps {
   // 900. Defaults to 300 — bumping to 400+ helps compensate for the lack of subpixel AA
   // under the WebGL renderer.
   terminalFontWeight: number;
+  scrollback: number;
   // When true, spawn the backend PTY as soon as this tab mounts even if its host is currently
   // hidden (parking div / inactive group leaf). When false (legacy behavior), spawn waits
   // until the host has non-zero dimensions — i.e. until the user actually clicks the tab.
@@ -200,11 +215,14 @@ const DEFAULT_PANEL = 280;
 // panel is dragged to its widest, so it can cover almost the whole terminal but stay grabbable.
 const PANEL_EDGE_RESERVE = 76;
 
-export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fileExplorerOnStart, terminalBgColor, defaultFontSize, defaultShellId, fullscreenRendering, forceSyncOutput, webglRendering, terminalFontWeight, eagerInit, theme, projectEncodedName, showTerminalHeaderStats, onBranchSwitch }: TerminalTabProps) {
+export function TerminalTab({ tab, isActive, isVisible, gitLazyPolling, gitChangesTree, fileExplorerOnStart, terminalBgColor, defaultFontSize, defaultShellId, fullscreenRendering, forceSyncOutput, webglRendering, terminalFontWeight, scrollback, eagerInit, theme, projectEncodedName, showTerminalHeaderStats, onBranchSwitch }: TerminalTabProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const webglAddonRef = useRef<WebglAddon | null>(null);
+  const isVisibleRef = useRef(isVisible);
+  const windowVisible = useWindowVisible();
+  isVisibleRef.current = isVisible;
   const [_error, setError] = useState<string | null>(null);
   const tabRef = useRef(tab);
   // Loading state: true from spawn until the PTY emits its first byte. That window covers
@@ -328,7 +346,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
       cursorBlink: false,
       cursorStyle: "bar",
       cursorInactiveStyle: "outline",
-      scrollback: 10000,
+      scrollback,
       allowProposedApi: true,
       minimumContrastRatio: 1,
     });
@@ -379,7 +397,9 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
     // DOM renderer. The addon also raises a `contextLoss` event if the driver yanks the
     // context later — we dispose on that so xterm reverts cleanly to DOM rendering instead
     // of leaving a frozen canvas behind.
-    if (webglRendering) {
+    // Hidden tabs (eager init, restored tabs) start on the DOM renderer; the visibility
+    // effect below loads WebGL once the tab is shown.
+    if (webglRendering && isVisibleRef.current) {
       try {
         const addon = new WebglAddon();
         addon.onContextLoss(() => { addon.dispose(); webglAddonRef.current = null; });
@@ -614,25 +634,38 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
     term.options.fontWeightBold = Math.min(MAX_FONT_WEIGHT, terminalFontWeight + BOLD_OFFSET) as any;
   }, [terminalFontWeight]);
 
-  // Live-toggle the WebGL renderer when the user flips the setting without recreating the
-  // terminal. Disposing the addon hands rendering back to the default DOM renderer; loading
-  // a fresh one switches back. Wrapped in try/catch so a runtime failure (driver loss, etc.)
-  // doesn't tear down the surrounding effect.
+  // Apply scrollback changes live. Lowering it trims the oldest lines from the buffer.
+  useEffect(() => {
+    if (terminalRef.current) terminalRef.current.options.scrollback = scrollback;
+  }, [scrollback]);
+
+  // Load or release the WebGL renderer as the setting flips or the tab is shown/hidden,
+  // without recreating the terminal. Each WebGL addon holds a GPU context and glyph atlas,
+  // and the WebView caps live contexts (~16), so only on-screen tabs keep one. Disposing
+  // hands rendering back to the DOM renderer (which idles while hidden); loading a fresh
+  // one switches back. Hiding releases after a short delay so quick back-and-forth tab
+  // switching doesn't rebuild the atlas each time. Wrapped in try/catch so a runtime
+  // failure (driver loss, etc.) doesn't tear down the surrounding effect.
   useEffect(() => {
     const term = terminalRef.current;
     if (!term) return;
-    if (webglRendering && !webglAddonRef.current) {
+    const release = () => {
+      if (webglAddonRef.current) { webglAddonRef.current.dispose(); webglAddonRef.current = null; }
+    };
+    if (!webglRendering) { release(); return; }
+    if (!isVisible) {
+      const id = window.setTimeout(release, WEBGL_RELEASE_DELAY_MS);
+      return () => window.clearTimeout(id);
+    }
+    if (!webglAddonRef.current) {
       try {
         const addon = new WebglAddon();
         addon.onContextLoss(() => { addon.dispose(); webglAddonRef.current = null; });
         term.loadAddon(addon);
         webglAddonRef.current = addon;
       } catch (_) {}
-    } else if (!webglRendering && webglAddonRef.current) {
-      webglAddonRef.current.dispose();
-      webglAddonRef.current = null;
     }
-  }, [webglRendering]);
+  }, [webglRendering, isVisible]);
 
   // Refit terminal whenever either side panel opens/closes or the shared width changes
   useEffect(() => {
@@ -865,14 +898,15 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
   // Continuous polling. In lazy mode (default), polling runs only while the panel is open —
   // so a closed panel is essentially free. In eager mode, it runs whenever the tab is the
   // active one. Raw shells skip this entirely; they don't have git chrome anywhere.
+  // Paused while the window is minimized; resumes (with an immediate fetch) when shown.
   useEffect(() => {
-    if (!isActive || !tab.projectPath || !isClaudeSession) return;
+    if (!isActive || !windowVisible || !tab.projectPath || !isClaudeSession) return;
     const shouldPoll = gitLazyPolling ? showGitPanel : true;
     if (!shouldPoll) return;
     fetchGitStatus();
     const interval = setInterval(fetchGitStatus, 3000);
     return () => clearInterval(interval);
-  }, [isActive, tab.projectPath, gitLazyPolling, showGitPanel, isClaudeSession, fetchGitStatus]);
+  }, [isActive, windowVisible, tab.projectPath, gitLazyPolling, showGitPanel, isClaudeSession, fetchGitStatus]);
 
   // Drop stale stats whenever the underlying session changes (raw shell / no sessionId /
   // session swap via /branch). Polling itself only runs while active — but we keep the
@@ -882,37 +916,39 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
     if (!isClaudeSession || !tab.sessionId || !projectEncodedName) setSessionStats(null);
   }, [isClaudeSession, tab.sessionId, projectEncodedName]);
 
-  // Poll session stats (cost, context tokens) while active. Cost ticks up as claude works,
-  // so 4s feels live without hammering disk; the underlying Rust cache short-circuits when
-  // mtimes haven't changed. Skipped entirely for raw shells and tabs without a sessionId.
+  // Session stats (cost, context tokens) while active: fetched on activation, then whenever
+  // the backend watcher reports changed agent data (throttled to ~2s while an agent works).
+  // Skipped entirely for raw shells and tabs without a sessionId.
+  const statsEnabled = isActive && isClaudeSession && !!tab.sessionId && !!projectEncodedName;
+  const statsReqRef = useRef(0);
+  const fetchStats = useCallback(async () => {
+    if (!tab.sessionId || !projectEncodedName) return;
+    const req = ++statsReqRef.current;
+    try {
+      const sessions = await invoke<SessionInfo[]>("get_sessions", { encodedName: projectEncodedName });
+      if (req !== statsReqRef.current) return; // a newer fetch (or deactivation) superseded this one
+      const match = sessions.find(s => s.id === tab.sessionId);
+      if (match) setSessionStats(match);
+    } catch (_) {}
+  }, [tab.sessionId, projectEncodedName]);
   useEffect(() => {
-    if (!isActive || !isClaudeSession || !tab.sessionId || !projectEncodedName) return;
-    let cancelled = false;
-    const fetchStats = async () => {
-      try {
-        const sessions = await invoke<SessionInfo[]>("get_sessions", { encodedName: projectEncodedName });
-        if (cancelled) return;
-        const match = sessions.find(s => s.id === tab.sessionId);
-        if (match) setSessionStats(match);
-      } catch (_) {}
-    };
+    if (!statsEnabled) return;
     fetchStats();
-    const interval = setInterval(fetchStats, 4000);
-    return () => { cancelled = true; clearInterval(interval); };
-  }, [isActive, isClaudeSession, tab.sessionId, projectEncodedName]);
+    return () => { statsReqRef.current++; };
+  }, [statsEnabled, fetchStats]);
+  useAgentDataChanged(fetchStats, { enabled: statsEnabled });
 
-  // Poll every 5s, but only while this tab is the active (focused) one. Background tabs
-  // don't scan — the user can't /branch in a tab they aren't looking at. On each tick we
-  // ask Rust whether any jsonl has appeared in the project that (a) isn't in our known
+  // Only while this tab is the active (focused) one. Background tabs don't scan — the user
+  // can't /branch in a tab they aren't looking at. On each check we ask Rust whether any jsonl has appeared in the project that (a) isn't in our known
   // set and (b) has the UUID fingerprint of a fork of our current session.
   useEffect(() => {
     if (!isActive) return;
     if (!tab.projectPath || !tab.sessionId) return;
     if ((tab.shellMode || "claude") !== "claude") return;
     checkBranch();
-    const interval = window.setInterval(checkBranch, 5000);
-    return () => window.clearInterval(interval);
   }, [isActive, tab.projectPath, tab.sessionId, tab.shellMode, checkBranch]);
+  // A fork shows up as a new Claude jsonl, so re-check when the watcher reports Claude changes.
+  useAgentDataChanged(checkBranch, { enabled: isActive && !!tab.projectPath && !!tab.sessionId && (tab.shellMode || "claude") === "claude", filter: ["claude"] });
 
   // Refresh commit history whenever the History tab is shown, and when `ahead` changes
   // (likely a new local commit). Cheap enough to just re-fetch alongside normal polls too.

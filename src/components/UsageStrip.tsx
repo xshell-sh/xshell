@@ -5,6 +5,7 @@ import { ClaudeChatIcon } from "./ClaudeChatIcon";
 import { OpenAIIcon } from "./OpenAIIcon";
 import { ttProps, type TtFns } from "./Tooltip";
 import { timeAgo } from "../utils";
+import { useWindowVisible } from "../hooks/useWindowVisible";
 import type { ClaudeCostSummary, CodexUsage, SessionInfo } from "../types";
 
 interface GlobalRateLimits {
@@ -71,7 +72,11 @@ export function UsageStrip({ recentSessions, tt, onOpenSettings }: UsageStripPro
   const [claudeLimits, setClaudeLimits] = useState<GlobalRateLimits | null>(null);
   const [codex, setCodex] = useState<CodexUsage | null>(null);
 
+  // Refreshed every 60s while the window is on screen; paused while minimized, with an
+  // immediate refresh when it's shown again.
+  const windowVisible = useWindowVisible();
   useEffect(() => {
+    if (!windowVisible) return;
     let cancelled = false;
     const refresh = () => {
       invoke<ClaudeCostSummary>("get_claude_cost_summary").then(v => { if (!cancelled) setClaudeCost(v); }).catch(() => {});
@@ -81,7 +86,7 @@ export function UsageStrip({ recentSessions, tt, onOpenSettings }: UsageStripPro
     refresh();
     const timer = setInterval(refresh, 60000);
     return () => { cancelled = true; clearInterval(timer); };
-  }, []);
+  }, [windowVisible]);
 
   const today = localDate(new Date());
   const weekDates = useMemo(() => new Set(lastNDates(7)), [today]);

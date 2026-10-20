@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Activity } from "lucide-react";
 import { AGENTS, AgentIcon, type AgentId } from "../agents";
 import type { CodexUsage } from "../types";
+import { useAgentDataChanged } from "../hooks/useAgentDataChanged";
 
 // Claude's account-wide rate-limit snapshot, sourced from the freshest xshell-stats file
 // across all sessions. Claude Code reports the same 5h/7d numbers on every session's
@@ -128,29 +129,29 @@ export function RateLimitIndicator({ showClaude, showCodex }: { showClaude: bool
   const [hoverRect, setHoverRect] = useState<DOMRect | null>(null);
   const hideTimer = useRef<number | null>(null);
 
-  // Claude's hook file is cheap to read → poll every 8s, refresh on focus. Codex requires
-  // scanning rollout files and only changes when Codex runs, so poll it less often.
+  // Fetch on mount and on focus, then whenever the backend watcher reports that the
+  // agent's data changed (Claude: the statusline hook's stats files; Codex: rollouts).
   useEffect(() => {
     let cancelled = false;
     if (!showClaude) { setClaude(null); return; }
     const fetch = () => invoke<GlobalRateLimits>("get_global_rate_limits").then(d => { if (!cancelled) setClaude(d); }).catch(() => {});
     fetch();
-    const id = setInterval(fetch, 8000);
     const onFocus = () => fetch();
     window.addEventListener("focus", onFocus);
-    return () => { cancelled = true; clearInterval(id); window.removeEventListener("focus", onFocus); };
+    return () => { cancelled = true; window.removeEventListener("focus", onFocus); };
   }, [showClaude]);
+  useAgentDataChanged(() => { invoke<GlobalRateLimits>("get_global_rate_limits").then(setClaude).catch(() => {}); }, { enabled: showClaude, filter: ["claude-stats"] });
 
   useEffect(() => {
     let cancelled = false;
     if (!showCodex) { setCodex(null); return; }
     const fetch = () => invoke<CodexUsage>("get_codex_usage").then(d => { if (!cancelled) setCodex(d); }).catch(() => {});
     fetch();
-    const id = setInterval(fetch, 30000);
     const onFocus = () => fetch();
     window.addEventListener("focus", onFocus);
-    return () => { cancelled = true; clearInterval(id); window.removeEventListener("focus", onFocus); };
+    return () => { cancelled = true; window.removeEventListener("focus", onFocus); };
   }, [showCodex]);
+  useAgentDataChanged(() => { invoke<CodexUsage>("get_codex_usage").then(setCodex).catch(() => {}); }, { enabled: showCodex, filter: ["codex"], fallbackMs: 120000 });
 
   // Assemble the visible sources. An agent contributes only when enabled AND it actually
   // has a percentage to show — no empty placeholder rows.

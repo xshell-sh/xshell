@@ -4,6 +4,7 @@ import { ChevronRight, RefreshCw, Folder, ArrowUp, Search, X as XIcon, FolderOpe
 import type { DirItem } from "../types";
 import { AgentIcon, type AgentId } from "../agents";
 import { fileIconUrl, folderIconUrl } from "../lib/fileIcons";
+import { useWindowVisible } from "../hooks/useWindowVisible";
 
 // Agent config folders get their brand icon instead of a generic folder — a little flourish
 // so `.claude` / `.codex` / `.cursor` / `.opencode` / `.agents` (Antigravity) are recognizable
@@ -191,14 +192,15 @@ export function FileExplorerPanel({ rootPath, terminalId, visible, showTt, hideT
   // Poll for filesystem changes while the panel is visible (the agent adds/removes files, etc.)
   // so the tree updates without a manual refresh. `tick` is threaded into every Node so expanded
   // sub-folders re-pull too; list_dir is async (off the UI thread) so this stays cheap. Silent
-  // (no spinner) and paused while hidden or searching.
+  // (no spinner) and paused while hidden, searching, or the window is minimized.
   const [tick, setTick] = useState(0);
+  const windowVisible = useWindowVisible();
   useEffect(() => {
-    if (!visible || searchOpen) return;
+    if (!visible || searchOpen || !windowVisible) return;
     setTick(t => t + 1); // refresh right away on (re)show, then keep polling
     const id = window.setInterval(() => setTick(t => t + 1), 2500);
     return () => window.clearInterval(id);
-  }, [visible, searchOpen]);
+  }, [visible, searchOpen, windowVisible]);
   const loadRef = useRef(load);
   loadRef.current = load;
   useEffect(() => { if (tick > 0) loadRef.current(true); }, [tick]);

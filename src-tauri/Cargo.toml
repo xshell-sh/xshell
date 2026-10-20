@@ -25,6 +25,7 @@ uuid = { version = "1", features = ["v4"] }
 # depend on a system libsqlite. md5: Cursor keys chat folders by md5 of the workspace cwd.
 rusqlite = { version = "0.31", features = ["bundled"] }
 md5 = "0.7"
+notify = "8"
 
 # Dev profile: fast incremental rebuilds, light optimization for deps
 [profile.dev]
@@ -38,11 +39,12 @@ debug = true
 opt-level = 1
 debug = false
 
-# Release profile: optimize for size + strip debug symbols.
-# Tauri release builds produced ~1.5 GB of intermediate artifacts; these
-# settings reduce disk usage significantly and also shrink the final binary.
+# Release profile: optimize for speed + strip debug symbols.
+# opt-level 3 (not "s"): session parsing and JSON handling are hot paths, and the size
+# difference for a backend this small is negligible. lto/codegen-units/strip keep the binary
+# small and the intermediate artifacts (~1.5 GB without them) down.
 [profile.release]
-opt-level = "s"
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"

@@ -10,6 +10,7 @@ import { DARK_TERM_BG, LIGHT_TERM_BG } from "./TerminalTab";
 import type { UpdateInfo, ReleaseEntry } from "../hooks/useUpdateCheck";
 import { useInstaller } from "../hooks/useInstaller";
 import { renderMarkdown } from "../markdown";
+import { DEFAULT_SCROLLBACK, MIN_SCROLLBACK, MAX_SCROLLBACK } from "./TerminalTab";
 
 export type ThemeMode = "dark" | "light";
 
@@ -42,6 +43,8 @@ interface SettingsViewProps {
   onSetWebglRendering: (enabled: boolean) => void;
   terminalFontWeight: number;
   onSetTerminalFontWeight: (weight: number) => void;
+  terminalScrollback: number;
+  onSetTerminalScrollback: (lines: number) => void;
   eagerInitTabs: boolean;
   onSetEagerInitTabs: (enabled: boolean) => void;
   showRateLimitInSidebar: boolean;
@@ -167,7 +170,7 @@ function Section({ title, description, children }: { title: string; description?
   );
 }
 
-export function SettingsView({ theme, onSetTheme, defaultAgent, onSetDefaultAgent, gitLazyPolling, onSetGitLazyPolling, gitChangesTree, onSetGitChangesTree, fileExplorerOnStart, onSetFileExplorerOnStart, contextTreeEnabled, onSetContextTreeEnabled, terminalBgColor, onSetTerminalBgColor, defaultTerminalFontSize, onSetDefaultTerminalFontSize, alwaysOnTop, onSetAlwaysOnTop, defaultShell, onSetDefaultShell, fullscreenRendering, onSetFullscreenRendering, forceSyncOutput, onSetForceSyncOutput, webglRendering, onSetWebglRendering, terminalFontWeight, onSetTerminalFontWeight, eagerInitTabs, onSetEagerInitTabs, showRateLimitInSidebar, onSetShowRateLimitInSidebar, showSessionRowMetrics, onSetShowSessionRowMetrics, showSessionRowMetricsCodex, onSetShowSessionRowMetricsCodex, showSessionRowMetricsOpencode, onSetShowSessionRowMetricsOpencode, showRateLimitInSidebarCodex, onSetShowRateLimitInSidebarCodex, showTerminalHeaderStats, onSetShowTerminalHeaderStats, showProjectStatsChart, onSetShowProjectStatsChart, updateInfo }: SettingsViewProps) {
+export function SettingsView({ theme, onSetTheme, defaultAgent, onSetDefaultAgent, gitLazyPolling, onSetGitLazyPolling, gitChangesTree, onSetGitChangesTree, fileExplorerOnStart, onSetFileExplorerOnStart, contextTreeEnabled, onSetContextTreeEnabled, terminalBgColor, onSetTerminalBgColor, defaultTerminalFontSize, onSetDefaultTerminalFontSize, alwaysOnTop, onSetAlwaysOnTop, defaultShell, onSetDefaultShell, fullscreenRendering, onSetFullscreenRendering, forceSyncOutput, onSetForceSyncOutput, webglRendering, onSetWebglRendering, terminalFontWeight, onSetTerminalFontWeight, terminalScrollback, onSetTerminalScrollback, eagerInitTabs, onSetEagerInitTabs, showRateLimitInSidebar, onSetShowRateLimitInSidebar, showSessionRowMetrics, onSetShowSessionRowMetrics, showSessionRowMetricsCodex, onSetShowSessionRowMetricsCodex, showSessionRowMetricsOpencode, onSetShowSessionRowMetricsOpencode, showRateLimitInSidebarCodex, onSetShowRateLimitInSidebarCodex, showTerminalHeaderStats, onSetShowTerminalHeaderStats, showProjectStatsChart, onSetShowProjectStatsChart, updateInfo }: SettingsViewProps) {
   const [active, setActive] = useState<Category>("appearance");
   const [wizardOpen, setWizardOpen] = useState(false);
   // Has the user run the wizard? Drives the disabled-state of the rate-limit + session-row
@@ -392,6 +395,17 @@ export function SettingsView({ theme, onSetTheme, defaultAgent, onSetDefaultAgen
                     </div>
                     {terminalFontWeight !== 400 && (
                       <button className="settings-reset-btn settings-reset-btn-block" onClick={() => onSetTerminalFontWeight(400)} {...ttProps(tt, "Reset to default")}><RotateCcw size={11} /> Reset</button>
+                    )}
+                  </div>
+                </SettingRow>
+                <SettingRow title="Scrollback" description="Lines of history each terminal keeps. Every open tab holds its own history in memory, so lower values save RAM with many tabs open. Lowering it trims the oldest lines.">
+                  <div className="settings-zoom-col">
+                    <div className="settings-zoom-row">
+                      <input type="range" className="settings-range" min={MIN_SCROLLBACK} max={MAX_SCROLLBACK} step={1000} value={terminalScrollback} onChange={(e) => onSetTerminalScrollback(parseInt(e.target.value, 10))} />
+                      <span className="settings-zoom-value">{terminalScrollback.toLocaleString()}</span>
+                    </div>
+                    {terminalScrollback !== DEFAULT_SCROLLBACK && (
+                      <button className="settings-reset-btn settings-reset-btn-block" onClick={() => onSetTerminalScrollback(DEFAULT_SCROLLBACK)} {...ttProps(tt, "Reset to default")}><RotateCcw size={11} /> Reset</button>
                     )}
                   </div>
                 </SettingRow>

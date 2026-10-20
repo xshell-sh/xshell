@@ -10,7 +10,7 @@ import { TabBar } from "./components/TabBar";
 import { HomeView } from "./components/HomeView";
 import { TerminalTab } from "./components/TerminalTab";
 import { SettingsView, type ThemeMode } from "./components/SettingsView";
-import { DARK_TERM_BG, LIGHT_TERM_BG } from "./components/TerminalTab";
+import { DARK_TERM_BG, LIGHT_TERM_BG, DEFAULT_SCROLLBACK, MIN_SCROLLBACK, MAX_SCROLLBACK } from "./components/TerminalTab";
 import { ProjectEditorDialog } from "./components/ProjectEditorDialog";
 import { ProjectPicker } from "./components/ProjectPicker";
 import { AgentPickerDialog } from "./components/AgentPickerDialog";
@@ -19,6 +19,7 @@ import type { ProjectInfo, ProjectSettings, SessionFolder, SessionInfo, Tab, Gro
 import { GroupView } from "./components/GroupView";
 import { countLeaves, collectLeafIds, insertLeaf, removeLeaf, setRatioAt, DropZone } from "./layout";
 import { useUpdateCheck } from "./hooks/useUpdateCheck";
+import { useAgentDataChanged } from "./hooks/useAgentDataChanged";
 import { UpdateDialog } from "./components/UpdateDialog";
 
 // Flatten sidebar items to an ordered list of project paths (folders expanded in place).
@@ -139,6 +140,7 @@ export default function App() {
   // CSS font weight applied to terminal text. 300 matches the original hardcoded value;
   // 400 reads heavier and helps compensate for the WebGL renderer's grayscale-only AA.
   const [terminalFontWeight, setTerminalFontWeight] = useState(400);
+  const [terminalScrollback, setTerminalScrollback] = useState(DEFAULT_SCROLLBACK);
   // Spawn each restored tab's PTY on app launch instead of deferring until the user clicks the
   // tab. Default OFF — eager-init spawns every restored agent at once on launch (heavy, and
   // burns rate limits on sessions you may not open). Opt in via Settings; a persisted choice
@@ -198,11 +200,16 @@ export default function App() {
 
   // ── Initial load ──────────────────────────────────────────────────
   const [tabsRestored, setTabsRestored] = useState(false);
+  // Run once per app instance. React StrictMode (dev builds) mounts effects twice, which ran
+  // the whole startup load — settings restore plus the full session scan — twice in parallel.
+  const initialLoadStartedRef = useRef(false);
   useEffect(() => {
+    if (initialLoadStartedRef.current) return;
+    initialLoadStartedRef.current = true;
     (async () => {
       try {
         const store = await load("settings.json", { defaults: {}, autoSave: true });
-        const [paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode] = await Promise.all([
+        const [paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode, scrollback] = await Promise.all([
           store.get<string[]>("project_paths"),
           store.get<Record<string, ProjectSettings>>("project_icons"),
           store.get<Tab[]>("open_tabs"),
@@ -231,6 +238,7 @@ export default function App() {
           store.get<boolean>("session_row_metrics_codex"),
           store.get<boolean>("rate_limit_in_sidebar_codex"),
           store.get<boolean>("session_row_metrics_opencode"),
+          store.get<number>("terminal_scrollback"),
         ]);
         // Layout: prefer the explicit `sidebar_layout` if present; otherwise migrate
         // from the flat `project_paths` list by wrapping each path in a project item.
@@ -261,6 +269,7 @@ export default function App() {
         if (typeof eagerInit === "boolean") setEagerInitTabs(eagerInit);
         if (typeof webgl === "boolean") setWebglRendering(webgl);
         if (typeof fontWeight === "number" && fontWeight >= 100 && fontWeight <= 700) setTerminalFontWeight(fontWeight);
+        if (typeof scrollback === "number" && scrollback >= MIN_SCROLLBACK && scrollback <= MAX_SCROLLBACK) setTerminalScrollback(scrollback);
         if (typeof termHeaderStats === "boolean") setShowTerminalHeaderStats(termHeaderStats);
         if (typeof projectStatsChart === "boolean") setShowProjectStatsChart(projectStatsChart);
         if (storedTheme === "light" || storedTheme === "dark") setTheme(storedTheme);
@@ -368,8 +377,9 @@ export default function App() {
   }, [savedPaths, allProjects]);
 
   // ── Tab title sync: lightweight poll only when terminals are open ──
+  const syncTitlesRef = useRef<(() => void) | null>(null);
   useEffect(() => {
-    if (tabs.length === 0) return;
+    if (tabs.length === 0) { syncTitlesRef.current = null; return; }
 
     const syncTitles = async () => {
       // Distinct original-cased project paths across open tabs (encoding is case-sensitive).
@@ -377,14 +387,20 @@ export default function App() {
       const projectMap = new Map<string, ProjectInfo>();
       for (const p of allProjects) projectMap.set(p.path.toLowerCase(), p);
 
-      for (const origPath of origPaths) {
-        const pp = origPath.toLowerCase();
-        // Prefer Claude's recorded encoded name; otherwise mirror the Rust encoding so the
-        // poll also reaches Codex/Cursor-only projects (which carry no Claude encoded_name).
-        const encodedName = projectMap.get(pp)?.encoded_name || origPath.replace(/[^a-zA-Z0-9]/g, "-");
-        if (!encodedName) continue;
+      // Prefer Claude's recorded encoded name; otherwise mirror the Rust encoding so the
+      // poll also reaches Codex/Cursor-only projects (which carry no Claude encoded_name).
+      const targets = origPaths
+        .map(origPath => ({ pp: origPath.toLowerCase(), encodedName: projectMap.get(origPath.toLowerCase())?.encoded_name || origPath.replace(/[^a-zA-Z0-9]/g, "-") }))
+        .filter(t => t.encodedName);
+      if (targets.length === 0) return;
+      // One backend scan for all open projects instead of one per project.
+      let byProject: Record<string, SessionInfo[]>;
+      try { byProject = await invoke<Record<string, SessionInfo[]>>("get_sessions_for_projects", { encodedNames: targets.map(t => t.encodedName) }); }
+      catch (_) { return; }
+
+      for (const { pp, encodedName } of targets) {
+        const sessions = byProject[encodedName] ?? [];
         try {
-          const sessions = await invoke<SessionInfo[]>("get_sessions", { encodedName });
           setTabs(prev => {
             let changed = false;
             // Sessions already linked to an open tab — an unlinked tab must not claim them.
@@ -415,9 +431,11 @@ export default function App() {
       }
     };
 
-    const interval = setInterval(syncTitles, 5000);
-    return () => clearInterval(interval);
-  }, [tabs.length, allProjects]); // Only re-setup when tab count or projects change
+    syncTitlesRef.current = syncTitles;
+  }, [tabs.length, allProjects]);
+  // Refresh when the backend watcher reports changed session data (paused while minimized),
+  // with a slow fallback poll for agent directories it couldn't watch.
+  useAgentDataChanged(() => { syncTitlesRef.current?.(); }); // Only re-setup when tab count or projects change
 
   // ── Persistence ───────────────────────────────────────────────────
   const persistPaths = useCallback(async (paths: string[]) => {
@@ -545,6 +563,10 @@ export default function App() {
     try { const store = await load("settings.json", { defaults: {}, autoSave: true }); await store.set("webgl_rendering_enabled", enabled); } catch (_) {}
   }, []);
 
+  const persistTerminalScrollback = useCallback(async (lines: number) => {
+    setTerminalScrollback(lines);
+    try { const store = await load("settings.json", { defaults: {}, autoSave: true }); await store.set("terminal_scrollback", lines); } catch (_) {}
+  }, []);
   const persistTerminalFontWeight = useCallback(async (weight: number) => {
     setTerminalFontWeight(weight);
     try { const store = await load("settings.json", { defaults: {}, autoSave: true }); await store.set("terminal_font_weight", weight); } catch (_) {}
@@ -1138,7 +1160,7 @@ export default function App() {
       <div className="main-content">
         {/* Settings view — hidden unless activeTabId === 'settings' */}
         <div style={{ display: showSettings ? "flex" : "none", flex: 1, overflow: "hidden" }}>
-          <SettingsView theme={theme} onSetTheme={persistTheme} defaultAgent={defaultAgent} onSetDefaultAgent={persistDefaultAgent} gitLazyPolling={gitLazyPolling} onSetGitLazyPolling={persistGitLazyPolling} gitChangesTree={gitChangesTree} onSetGitChangesTree={persistGitChangesTree} fileExplorerOnStart={fileExplorerOnStart} onSetFileExplorerOnStart={persistFileExplorerOnStart} contextTreeEnabled={contextTreeEnabled} onSetContextTreeEnabled={persistContextTreeEnabled} terminalBgColor={terminalBgColor} onSetTerminalBgColor={persistTerminalBgColor} defaultTerminalFontSize={defaultTerminalFontSize} onSetDefaultTerminalFontSize={persistDefaultTerminalFontSize} alwaysOnTop={alwaysOnTop} onSetAlwaysOnTop={persistAlwaysOnTop} defaultShell={defaultShell} onSetDefaultShell={persistDefaultShell} fullscreenRendering={fullscreenRendering} onSetFullscreenRendering={persistFullscreenRendering} forceSyncOutput={forceSyncOutput} onSetForceSyncOutput={persistForceSyncOutput} webglRendering={webglRendering} onSetWebglRendering={persistWebglRendering} terminalFontWeight={terminalFontWeight} onSetTerminalFontWeight={persistTerminalFontWeight} eagerInitTabs={eagerInitTabs} onSetEagerInitTabs={persistEagerInitTabs} showRateLimitInSidebar={showRateLimitInSidebar} onSetShowRateLimitInSidebar={persistShowRateLimitInSidebar} showSessionRowMetrics={showSessionRowMetrics} onSetShowSessionRowMetrics={persistShowSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} onSetShowSessionRowMetricsCodex={persistShowSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} onSetShowSessionRowMetricsOpencode={persistShowSessionRowMetricsOpencode} showRateLimitInSidebarCodex={showRateLimitInSidebarCodex} onSetShowRateLimitInSidebarCodex={persistShowRateLimitInSidebarCodex} showTerminalHeaderStats={showTerminalHeaderStats} onSetShowTerminalHeaderStats={persistShowTerminalHeaderStats} showProjectStatsChart={showProjectStatsChart} onSetShowProjectStatsChart={persistShowProjectStatsChart} updateInfo={updateInfo} />
+          <SettingsView theme={theme} onSetTheme={persistTheme} defaultAgent={defaultAgent} onSetDefaultAgent={persistDefaultAgent} gitLazyPolling={gitLazyPolling} onSetGitLazyPolling={persistGitLazyPolling} gitChangesTree={gitChangesTree} onSetGitChangesTree={persistGitChangesTree} fileExplorerOnStart={fileExplorerOnStart} onSetFileExplorerOnStart={persistFileExplorerOnStart} contextTreeEnabled={contextTreeEnabled} onSetContextTreeEnabled={persistContextTreeEnabled} terminalBgColor={terminalBgColor} onSetTerminalBgColor={persistTerminalBgColor} defaultTerminalFontSize={defaultTerminalFontSize} onSetDefaultTerminalFontSize={persistDefaultTerminalFontSize} alwaysOnTop={alwaysOnTop} onSetAlwaysOnTop={persistAlwaysOnTop} defaultShell={defaultShell} onSetDefaultShell={persistDefaultShell} fullscreenRendering={fullscreenRendering} onSetFullscreenRendering={persistFullscreenRendering} forceSyncOutput={forceSyncOutput} onSetForceSyncOutput={persistForceSyncOutput} webglRendering={webglRendering} onSetWebglRendering={persistWebglRendering} terminalFontWeight={terminalFontWeight} onSetTerminalFontWeight={persistTerminalFontWeight} terminalScrollback={terminalScrollback} onSetTerminalScrollback={persistTerminalScrollback} eagerInitTabs={eagerInitTabs} onSetEagerInitTabs={persistEagerInitTabs} showRateLimitInSidebar={showRateLimitInSidebar} onSetShowRateLimitInSidebar={persistShowRateLimitInSidebar} showSessionRowMetrics={showSessionRowMetrics} onSetShowSessionRowMetrics={persistShowSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} onSetShowSessionRowMetricsCodex={persistShowSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} onSetShowSessionRowMetricsOpencode={persistShowSessionRowMetricsOpencode} showRateLimitInSidebarCodex={showRateLimitInSidebarCodex} onSetShowRateLimitInSidebarCodex={persistShowRateLimitInSidebarCodex} showTerminalHeaderStats={showTerminalHeaderStats} onSetShowTerminalHeaderStats={persistShowTerminalHeaderStats} showProjectStatsChart={showProjectStatsChart} onSetShowProjectStatsChart={persistShowProjectStatsChart} updateInfo={updateInfo} />
         </div>
         {/* Home view — hidden when a terminal tab is active */}
         <div style={{ display: showHome ? "flex" : "none", flex: 1, overflow: "hidden" }}>
@@ -1221,7 +1243,7 @@ export default function App() {
           // the subtree (which kills the PTY in TerminalTab's cleanup). Keying by tab.id
           // makes a reorder a pure move — the TerminalTab instance, xterm, and PTY survive.
           return createPortal(
-            <TerminalTab tab={tab} isActive={tab.id === activeTabId || (!!tab.groupId && tab.groupId === activeTabId && activeLeafByGroup[tab.groupId] === tab.id)} gitLazyPolling={gitLazyPolling} gitChangesTree={gitChangesTree} fileExplorerOnStart={fileExplorerOnStart} terminalBgColor={terminalBgColor} defaultFontSize={defaultTerminalFontSize} defaultShellId={defaultShell} fullscreenRendering={fullscreenRendering} forceSyncOutput={forceSyncOutput} webglRendering={webglRendering} terminalFontWeight={terminalFontWeight} eagerInit={eagerInitTabs} theme={theme} projectEncodedName={encodedName} showTerminalHeaderStats={showTerminalHeaderStats} onBranchSwitch={handleSwitchTabToBranch} />,
+            <TerminalTab tab={tab} isVisible={tab.id === activeTabId || (!!tab.groupId && tab.groupId === activeTabId)} isActive={tab.id === activeTabId || (!!tab.groupId && tab.groupId === activeTabId && activeLeafByGroup[tab.groupId] === tab.id)} gitLazyPolling={gitLazyPolling} gitChangesTree={gitChangesTree} fileExplorerOnStart={fileExplorerOnStart} terminalBgColor={terminalBgColor} defaultFontSize={defaultTerminalFontSize} defaultShellId={defaultShell} fullscreenRendering={fullscreenRendering} forceSyncOutput={forceSyncOutput} webglRendering={webglRendering} terminalFontWeight={terminalFontWeight} scrollback={terminalScrollback} eagerInit={eagerInitTabs} theme={theme} projectEncodedName={encodedName} showTerminalHeaderStats={showTerminalHeaderStats} onBranchSwitch={handleSwitchTabToBranch} />,
             host,
             tab.id,
           );
