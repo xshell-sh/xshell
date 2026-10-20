@@ -1529,6 +1529,13 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .upd-installing { font-size: 11px; color: var(--text-tertiary); padding: 8px 10px; background: var(--bg-deep); border: 1px dashed var(--border-default); border-radius: var(--radius-sm); line-height: 1.5; }
 .upd-progress { width: 100%; height: 6px; background: var(--bg-deep); border: 1px solid var(--border-subtle); border-radius: 3px; overflow: hidden; }
 .upd-progress-bar { height: 100%; background: var(--accent-coral); transition: width 120ms linear; }
+.pull-error span { white-space: pre-wrap; word-break: break-word; font-family: var(--font-mono); }
+.pull-commits { display: flex; flex-direction: column; gap: 6px; }
+.pull-commit { display: grid; grid-template-columns: auto 1fr; column-gap: 8px; font-size: 12px; line-height: 1.4; }
+.pull-commit-hash { font-family: var(--font-mono); font-size: 11px; color: var(--accent-coral); }
+.pull-commit-subject { color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pull-commit-meta { grid-column: 2; font-size: 11px; color: var(--text-tertiary); }
+.pull-remaining { font-size: 11px; color: var(--text-tertiary); }
 .md-status { padding: 20px; text-align: center; color: var(--text-muted); font-size: 12px; }
 .md-status-error { color: var(--error); }
 .md-content { color: var(--text-secondary); font-size: 13px; line-height: 1.6; }

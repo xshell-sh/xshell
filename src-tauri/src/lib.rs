@@ -1887,6 +1887,104 @@ fn git_checkout(cwd: String, branch: String) -> Result<(), String> {
     Ok(())
 }
 
+// Runs a network git command (fetch/pull) with a time limit. Credential prompts are switched
+// off, so a repo without saved credentials fails fast instead of waiting for input that a
+// background check can never give; the time limit covers a hanging connection.
+fn git_network_cmd(cwd: &str, args: &[&str], timeout: std::time::Duration) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut cmd = git_cmd(cwd);
+    cmd.args(args).env("GIT_TERMINAL_PROMPT", "0").env("GCM_INTERACTIVE", "never")
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("git {} failed: {}", args[0], e))?;
+    let read_pipe = |pipe: Option<Box<dyn Read + Send>>| std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = pipe { let _ = p.read_to_end(&mut buf); }
+        buf
+    });
+    let out_reader = read_pipe(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let err_reader = read_pipe(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("git {} timed out", args[0]));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(e) => return Err(format!("git {} failed: {}", args[0], e)),
+        }
+    };
+    Ok(std::process::Output { status, stdout: out_reader.join().unwrap_or_default(), stderr: err_reader.join().unwrap_or_default() })
+}
+
+fn git_output_error(out: &std::process::Output, what: &str) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if stderr.is_empty() { format!("{} exited with status {}", what, out.status) } else { stderr }
+}
+
+// Remote state of a repo's current branch after a fresh `git fetch`, for the
+// "newer commits on GitHub" prompt shown when a project is opened.
+#[derive(Debug, Serialize, Clone)]
+pub struct GitRemoteState {
+    pub branch: String,
+    pub upstream: String,      // e.g. "origin/main"
+    pub upstream_hash: String, // commit the upstream points at; identifies what the user already declined
+    pub ahead: u32,
+    pub behind: u32,
+    pub changed_files: u32,    // uncommitted changes, which can block a pull
+    pub incoming: Vec<GitCommit>, // newest commits on the upstream that aren't local yet (max 10)
+}
+
+// None when the folder isn't a repo or its branch has no upstream to compare with.
+#[tauri::command]
+async fn git_fetch_remote(cwd: String) -> Result<Option<GitRemoteState>, String> {
+    let out = git_network_cmd(&cwd, &["fetch", "--quiet"], std::time::Duration::from_secs(30))?;
+    if !out.status.success() { return Err(git_output_error(&out, "git fetch")); }
+    let mut cmd = git_cmd(&cwd);
+    cmd.arg("status").arg("--porcelain=v1").arg("-b").arg("--untracked-files=no");
+    let st = match cmd.output() {
+        Ok(o) if o.status.success() => parse_porcelain(&String::from_utf8_lossy(&o.stdout)),
+        _ => return Ok(None),
+    };
+    if !st.has_upstream { return Ok(None); }
+    let rev = |arg: &str| -> String {
+        let mut c = git_cmd(&cwd);
+        c.arg("rev-parse").args(arg.split(' '));
+        c.output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default()
+    };
+    let upstream = rev("--abbrev-ref @{u}");
+    let upstream_hash = rev("@{u}");
+    let mut incoming = Vec::new();
+    if st.behind > 0 {
+        let mut c = git_cmd(&cwd);
+        c.arg("log").arg("-10").arg("--pretty=format:%H\x1f%h\x1f%s\x1f%an\x1f%cr").arg("HEAD..@{u}");
+        if let Ok(o) = c.output() {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                let p: Vec<&str> = line.splitn(5, '\x1f').collect();
+                if p.len() == 5 {
+                    incoming.push(GitCommit { hash: p[0].into(), short_hash: p[1].into(), subject: p[2].into(), author: p[3].into(), relative_time: p[4].into() });
+                }
+            }
+        }
+    }
+    Ok(Some(GitRemoteState {
+        branch: st.branch, upstream, upstream_hash, ahead: st.ahead, behind: st.behind,
+        changed_files: st.files.len() as u32, incoming,
+    }))
+}
+
+// Fast-forward only: when local and remote history have diverged, git refuses and the user
+// merges or rebases in the terminal themselves instead of xshell creating a merge commit.
+#[tauri::command]
+async fn git_pull(cwd: String) -> Result<String, String> {
+    let out = git_network_cmd(&cwd, &["pull", "--ff-only"], std::time::Duration::from_secs(120))?;
+    if !out.status.success() { return Err(git_output_error(&out, "git pull")); }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 // ── Terminal / PTY Commands ────────────────────────────────────────────
 
 // The Git Bash preset sends bare `bash.exe`, which on Windows resolves via PATH and gets
@@ -3327,7 +3425,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(AppState { terminals: Mutex::new(HashMap::new()) })
-        .invoke_handler(tauri::generate_handler![list_claude_projects, get_sessions, get_all_recent_sessions, get_session_messages, read_image_base64, save_dropped_file, read_text_file, reveal_in_explorer, list_dir, search_dir, open_url, get_username, get_home_dir, get_project_skills, get_project_memories, get_git_status, get_git_log, git_diff, git_stage, git_unstage, git_discard, list_git_branches, git_checkout, list_project_session_ids, detect_session_branch, probe_statusline_setup, get_global_rate_limits, detect_agent_binary, list_codex_projects, list_cursor_projects, list_opencode_projects, list_antigravity_projects, get_codex_context, get_cursor_context, get_opencode_context, get_antigravity_context, get_claude_cost_summary, get_codex_usage, spawn_terminal, write_terminal, resize_terminal, close_terminal])
+        .invoke_handler(tauri::generate_handler![list_claude_projects, get_sessions, get_all_recent_sessions, get_session_messages, read_image_base64, save_dropped_file, read_text_file, reveal_in_explorer, list_dir, search_dir, open_url, get_username, get_home_dir, get_project_skills, get_project_memories, get_git_status, get_git_log, git_diff, git_stage, git_unstage, git_discard, list_git_branches, git_checkout, git_fetch_remote, git_pull, list_project_session_ids, detect_session_branch, probe_statusline_setup, get_global_rate_limits, detect_agent_binary, list_codex_projects, list_cursor_projects, list_opencode_projects, list_antigravity_projects, get_codex_context, get_cursor_context, get_opencode_context, get_antigravity_context, get_claude_cost_summary, get_codex_usage, spawn_terminal, write_terminal, resize_terminal, close_terminal])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

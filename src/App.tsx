@@ -20,6 +20,8 @@ import { GroupView } from "./components/GroupView";
 import { countLeaves, collectLeafIds, insertLeaf, removeLeaf, setRatioAt, DropZone } from "./layout";
 import { useUpdateCheck } from "./hooks/useUpdateCheck";
 import { UpdateDialog } from "./components/UpdateDialog";
+import { useRemoteCheck } from "./hooks/useRemoteCheck";
+import { PullPromptDialog } from "./components/PullPromptDialog";
 
 // Flatten sidebar items to an ordered list of project paths (folders expanded in place).
 // Used to derive `savedPaths` for downstream code that doesn't care about folders.
@@ -331,6 +333,10 @@ export default function App() {
     setUpdateDialogOpen(true);
     setUpdateDialogShown(true);
   }, [lastSeenLoaded, updateDialogShown, updateInfo.loading, updateInfo.error, updateInfo.updateAvailable, updateInfo.latestVersion, lastSeenUpdateVersion]);
+
+  // Projects open in tabs are fetched on launch, when a tab opens and every 15 min; a branch
+  // that is behind its upstream (pushed from another computer) gets a pull prompt.
+  const { prompts: pullPrompts, decline: declinePullPrompt, resolve: resolvePullPrompt } = useRemoteCheck(tabs);
 
   // Any close path through the dialog runs through here. Always persists `last_seen_update_version`
   // so the dialog won't fire again until GitHub ships a NEWER tag — the badge + About dot are
@@ -1237,6 +1243,10 @@ export default function App() {
         return <ProjectEditorDialog project={proj} settings={settings} onSave={(s) => handleSaveProjectSettings(editingProjectPath, s)} onClose={() => setEditingProjectPath(null)} />;
       })()}
       {updateDialogOpen && <UpdateDialog info={updateInfo} onDismiss={dismissUpdateDialog} />}
+      {!updateDialogOpen && pullPrompts.length > 0 && (
+        <PullPromptDialog prompt={pullPrompts[0]} remaining={pullPrompts.length - 1}
+          onPulled={() => resolvePullPrompt(pullPrompts[0].key)} onLater={() => declinePullPrompt(pullPrompts[0].key)} />
+      )}
     </div>
   );
 }

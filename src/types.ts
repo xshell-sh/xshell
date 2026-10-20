@@ -150,6 +150,17 @@ export interface GitCommit {
   relative_time: string;
 }
 
+// Current branch vs its upstream after a fresh fetch (git_fetch_remote).
+export interface GitRemoteState {
+  branch: string;
+  upstream: string;       // e.g. "origin/main"
+  upstream_hash: string;
+  ahead: number;
+  behind: number;
+  changed_files: number;  // uncommitted changes
+  incoming: GitCommit[];  // newest upstream commits not yet pulled (max 10)
+}
+
 export interface GitBranch {
   name: string;                 // short name (e.g. "main" or "feature/foo")
   full_ref: string;             // "refs/heads/main" | "refs/remotes/origin/foo"
