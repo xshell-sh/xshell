@@ -89,6 +89,13 @@ export interface ProjectSettings {
   folders?: SessionFolder[];
 }
 
+// A git repository inside a project folder (see scan_git_repos in lib.rs).
+export interface GitRepo {
+  path: string;
+  // Relative to the project folder; "" for the project folder itself.
+  rel: string;
+}
+
 export interface SessionInfo {
   id: string;
   title: string;

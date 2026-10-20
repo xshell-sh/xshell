@@ -1585,6 +1585,52 @@ fn parse_porcelain(output: &str) -> GitStatus {
     status
 }
 
+// Git repositories inside a project folder, like VS Code's repository scan: the folder itself
+// when it is a repo, plus repos in subfolders up to GIT_REPO_SCAN_DEPTH levels down. A project
+// such as a client folder holding several separate repos gets one entry per repo. Dependency,
+// build and hidden folders are skipped, and the scan doesn't descend into a nested repo it found.
+const GIT_REPO_SCAN_DEPTH: usize = 3;
+const GIT_REPO_SCAN_SKIP: [&str; 9] = ["node_modules", "target", "dist", "build", "out", "vendor", "bin", "obj", "__pycache__"];
+
+#[derive(Debug, Serialize, Clone)]
+pub struct GitRepo {
+    pub path: String,
+    // Path relative to the project folder ("" for the project folder itself).
+    pub rel: String,
+}
+
+fn scan_git_repos(root: String) -> Vec<GitRepo> {
+    let root_path = PathBuf::from(&root);
+    let is_repo = |p: &std::path::Path| p.join(".git").exists(); // dir, or file for worktrees/submodules
+    let mut repos: Vec<GitRepo> = vec![];
+    if is_repo(&root_path) { repos.push(GitRepo { path: root.clone(), rel: String::new() }); }
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root_path.clone(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth >= GIT_REPO_SCAN_DEPTH { continue; }
+        for entry in fs::read_dir(&dir).ok().into_iter().flatten().flatten() {
+            if !entry.file_type().map_or(false, |ft| ft.is_dir()) { continue; }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || GIT_REPO_SCAN_SKIP.contains(&name.as_str()) { continue; }
+            let p = entry.path();
+            if is_repo(&p) {
+                let rel = p.strip_prefix(&root_path).map(|r| r.to_string_lossy().into_owned()).unwrap_or_default();
+                repos.push(GitRepo { path: p.to_string_lossy().into_owned(), rel });
+            } else {
+                stack.push((p, depth + 1));
+            }
+        }
+    }
+    // Project folder first, then nested repos alphabetically.
+    repos.sort_by(|a, b| (!a.rel.is_empty(), a.rel.to_lowercase()).cmp(&(!b.rel.is_empty(), b.rel.to_lowercase())));
+    repos
+}
+
+// Runs on the blocking pool: a directory walk over the project folder.
+#[tauri::command]
+async fn find_git_repos(root: String) -> Result<Vec<GitRepo>, String> {
+    tauri::async_runtime::spawn_blocking(move || scan_git_repos(root)).await.map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn get_git_status(cwd: String) -> GitStatus {
     use std::process::Command;
@@ -3327,7 +3373,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(AppState { terminals: Mutex::new(HashMap::new()) })
-        .invoke_handler(tauri::generate_handler![list_claude_projects, get_sessions, get_all_recent_sessions, get_session_messages, read_image_base64, save_dropped_file, read_text_file, reveal_in_explorer, list_dir, search_dir, open_url, get_username, get_home_dir, get_project_skills, get_project_memories, get_git_status, get_git_log, git_diff, git_stage, git_unstage, git_discard, list_git_branches, git_checkout, list_project_session_ids, detect_session_branch, probe_statusline_setup, get_global_rate_limits, detect_agent_binary, list_codex_projects, list_cursor_projects, list_opencode_projects, list_antigravity_projects, get_codex_context, get_cursor_context, get_opencode_context, get_antigravity_context, get_claude_cost_summary, get_codex_usage, spawn_terminal, write_terminal, resize_terminal, close_terminal])
+        .invoke_handler(tauri::generate_handler![find_git_repos, list_claude_projects, get_sessions, get_all_recent_sessions, get_session_messages, read_image_base64, save_dropped_file, read_text_file, reveal_in_explorer, list_dir, search_dir, open_url, get_username, get_home_dir, get_project_skills, get_project_memories, get_git_status, get_git_log, git_diff, git_stage, git_unstage, git_discard, list_git_branches, git_checkout, list_project_session_ids, detect_session_branch, probe_statusline_setup, get_global_rate_limits, detect_agent_binary, list_codex_projects, list_cursor_projects, list_opencode_projects, list_antigravity_projects, get_codex_context, get_cursor_context, get_opencode_context, get_antigravity_context, get_claude_cost_summary, get_codex_usage, spawn_terminal, write_terminal, resize_terminal, close_terminal])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

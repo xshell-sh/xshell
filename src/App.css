@@ -652,6 +652,11 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .terminal-container .xterm { height: 100%; }
 .terminal-container .xterm-viewport { overflow-y: auto !important; }
 
+/* Repository picker at the top of the git panel, shown when the project holds several repos. */
+.git-repo-picker { display: flex; align-items: center; gap: 6px; padding: 6px 10px; border-bottom: 1px solid var(--border-subtle); }
+.git-repo-picker-icon { color: var(--text-tertiary); flex-shrink: 0; }
+.git-repo-select { flex: 1; min-width: 0; }
+
 /* Loading overlay shown over the terminal until the PTY's first byte arrives — masks
    the blank xterm during Node.js boot + claude TUI first paint. The background inherits
    from the terminal-container itself, so the overlay blends with whatever palette/bg the
