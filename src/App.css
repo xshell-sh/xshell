@@ -651,6 +651,13 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .terminal-container { flex: 1; padding: 4px; background: var(--bg-surface); overflow: hidden; min-width: 0; position: relative; }
 .terminal-container .xterm { height: 100%; }
 .terminal-container .xterm-viewport { overflow-y: auto !important; }
+/* Terminal scrollbar: wider and higher-contrast than the app-wide 5px one, so it can be
+   grabbed and dragged through long agent output. Only appears when there is scrollback. */
+.terminal-container .xterm-viewport::-webkit-scrollbar { width: 10px; }
+.terminal-container .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
+.terminal-container .xterm-viewport::-webkit-scrollbar-thumb { background: var(--text-muted); border-radius: 5px; border: 2px solid transparent; background-clip: padding-box; min-height: 32px; }
+.terminal-container .xterm-viewport::-webkit-scrollbar-thumb:hover,
+.terminal-container .xterm-viewport::-webkit-scrollbar-thumb:active { background: var(--text-secondary); background-clip: padding-box; }
 
 /* Loading overlay shown over the terminal until the PTY's first byte arrives — masks
    the blank xterm during Node.js boot + claude TUI first paint. The background inherits

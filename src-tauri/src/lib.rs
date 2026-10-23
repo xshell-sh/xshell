@@ -147,6 +147,31 @@ fn stats_path_for(session_id: &str) -> Option<PathBuf> {
     Some(dirs::home_dir()?.join(".claude").join("xshell-stats").join(format!("{}.json", session_id)))
 }
 
+// Title text for a user prompt. Slash commands are recorded as
+// `<command-name>/goal</command-name><command-message>…</command-message><command-args>…</command-args>`
+// (tag order varies) — shown as "/goal args". Lines that are pure system wrappers
+// (`<local-command-caveat>`, `<local-command-stdout>`, …) aren't something the user typed
+// and yield None, so the next real prompt becomes the title. Whitespace is collapsed and
+// the result capped at 120 chars.
+fn prompt_title(raw: &str) -> Option<String> {
+    let tag = |name: &str| -> Option<String> {
+        let open = format!("<{}>", name);
+        let start = raw.find(&open)? + open.len();
+        let end = raw[start..].find(&format!("</{}>", name))? + start;
+        Some(raw[start..end].trim().to_string())
+    };
+    let text = if let Some(cmd) = tag("command-name") {
+        let args = tag("command-args").unwrap_or_default();
+        if args.is_empty() { cmd } else { format!("{} {}", cmd, args) }
+    } else if raw.trim_start().starts_with('<') && raw.trim_end().ends_with('>') && raw.contains("</") {
+        return None;
+    } else {
+        raw.to_string()
+    };
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() { None } else { Some(collapsed.chars().take(120).collect()) }
+}
+
 fn parse_session(path: &std::path::Path, project_name: &str, project_path: &str) -> Option<SessionInfo> {
     let session_id = path.file_stem()?.to_string_lossy().to_string();
     let metadata = fs::metadata(path).ok()?;
@@ -259,7 +284,7 @@ fn parse_session(path: &std::path::Path, project_name: &str, project_path: &str)
                 if let Some(content) = content_node {
                     if let Some(s) = content.as_str() {
                         is_real_prompt = !s.is_empty();
-                        prompt_text = Some(s.chars().take(120).collect());
+                        prompt_text = Some(s.to_string());
                     } else if let Some(arr) = content.as_array() {
                         // Real prompt = at least one text/image part AND no tool_result parts.
                         let has_tool_result = arr.iter().any(|item| item.get("type").and_then(|t| t.as_str()) == Some("tool_result"));
@@ -271,7 +296,7 @@ fn parse_session(path: &std::path::Path, project_name: &str, project_path: &str)
                         if is_real_prompt {
                             for item in arr {
                                 if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                                    prompt_text = Some(text.chars().take(120).collect());
+                                    prompt_text = Some(text.to_string());
                                     break;
                                 }
                             }
@@ -281,7 +306,7 @@ fn parse_session(path: &std::path::Path, project_name: &str, project_path: &str)
                 if is_real_prompt {
                     message_count += 1;
                     if first_human_message.is_empty() {
-                        if let Some(t) = prompt_text { first_human_message = t; }
+                        if let Some(t) = prompt_text.as_deref().and_then(prompt_title) { first_human_message = t; }
                     }
                 }
             }
@@ -505,8 +530,10 @@ fn parse_codex_session(path: &std::path::Path, names: &HashMap<String, String>) 
                 Some("user_message") => {
                     message_count += 1;
                     if first_user_message.is_empty() {
-                        if let Some(m) = payload.get("message").and_then(|v| v.as_str()) {
-                            first_user_message = m.trim().replace('\n', " ").chars().take(120).collect();
+                        // Same cleaning as Claude titles (Codex can import Claude sessions,
+                        // slash-command markup included).
+                        if let Some(t) = payload.get("message").and_then(|v| v.as_str()).and_then(prompt_title) {
+                            first_user_message = t;
                         }
                     }
                 }
@@ -1919,6 +1946,32 @@ const READ_BUF: usize = 16 * 1024;
 const MAX_PENDING: usize = 4 * 1024 * 1024;
 const OVERFLOW_NOTICE: &[u8] = b"\x1bc\x1b[2m[xshell: dropped output due to backpressure]\x1b[0m\r\n";
 
+// Codex keeps its shared app-server daemon's PID in ~/.codex/app-server-daemon/daemon.pid and
+// trusts it on the next launch. Once the daemon has exited, Windows can hand that PID to an
+// unrelated (often protected) process, and `codex resume` then fails with "failed to open
+// daemon process: Access is denied (os error 5)". Before spawning Codex, move PID files whose
+// process is gone or isn't Codex aside, so Codex starts a fresh daemon.
+#[cfg(windows)]
+fn clear_stale_codex_daemon_pids() {
+    use std::os::windows::process::CommandExt;
+    let Some(dir) = dirs::home_dir().map(|h| h.join(".codex").join("app-server-daemon")) else { return };
+    for name in ["daemon.pid", "daemon-updater.pid"] {
+        let path = dir.join(name);
+        let Ok(content) = fs::read_to_string(&path) else { continue };
+        let Some(pid) = serde_json::from_str::<serde_json::Value>(&content).ok().and_then(|j| j.get("pid").and_then(|v| v.as_u64())) else { continue };
+        let Ok(out) = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .output() else { continue };
+        // Matching row: "image.exe","<pid>",... ; no match prints an INFO line instead.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let image = stdout.lines().find(|l| l.starts_with('"')).and_then(|l| l.split(',').next()).map(|f| f.trim_matches('"').to_ascii_lowercase());
+        if image.map_or(true, |img| !img.starts_with("codex")) {
+            let _ = fs::rename(&path, path.with_extension("pid.stale"));
+        }
+    }
+}
+
 #[tauri::command]
 fn spawn_terminal(state: State<'_, AppState>, id: String, session_id: Option<String>, cwd: String, cols: u16, rows: u16, shell_mode: Option<String>, shell_command: Option<String>, shell_id: Option<String>, agent: Option<String>, fullscreen_rendering: Option<bool>, force_sync_output: Option<bool>, on_data: Channel<Response>, on_exit: Channel<i32>) -> Result<(), String> {
     let pty_system = native_pty_system();
@@ -1934,6 +1987,8 @@ fn spawn_terminal(state: State<'_, AppState>, id: String, session_id: Option<Str
         Some("antigravity") => "agy",
         _ => "claude",
     };
+    #[cfg(windows)]
+    if agent_bin == "codex" { clear_stale_codex_daemon_pids(); }
     // Resume args per agent:
     //  - Claude: new chats arrive with a pre-allocated UUID and no JSONL on disk → use
     //    `--session-id` so Claude creates the session under our UUID (leaving customTitle
