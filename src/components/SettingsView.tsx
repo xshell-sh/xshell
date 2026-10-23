@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Paintbrush, Terminal as TerminalIcon, Settings as SettingsIcon, RotateCcw, Sparkles, Info, ExternalLink, RefreshCw, CheckCircle2, ChevronRight, Download, AlertTriangle, Loader2, Bot } from "lucide-react";
+import { Paintbrush, Terminal as TerminalIcon, Settings as SettingsIcon, RotateCcw, Minus, Plus, Link2, Sparkles, Info, ExternalLink, RefreshCw, CheckCircle2, ChevronRight, Download, AlertTriangle, Loader2, Bot } from "lucide-react";
 import { getAvailableShells } from "../shells";
 import { ShellIcon } from "./ShellIcon";
 import { AGENT_IDS, AGENTS, AgentIcon, type AgentId } from "../agents";
@@ -10,6 +10,7 @@ import { DARK_TERM_BG, LIGHT_TERM_BG } from "./TerminalTab";
 import type { UpdateInfo, ReleaseEntry } from "../hooks/useUpdateCheck";
 import { useInstaller } from "../hooks/useInstaller";
 import { renderMarkdown } from "../markdown";
+import { SelectMenu } from "./SelectMenu";
 
 export type ThemeMode = "dark" | "light";
 
@@ -42,6 +43,8 @@ interface SettingsViewProps {
   onSetWebglRendering: (enabled: boolean) => void;
   terminalFontWeight: number;
   onSetTerminalFontWeight: (weight: number) => void;
+  uiZoom: number;
+  onSetUiZoom: (percent: number) => void;
   eagerInitTabs: boolean;
   onSetEagerInitTabs: (enabled: boolean) => void;
   showRateLimitInSidebar: boolean;
@@ -81,7 +84,7 @@ type AgentProbeState = { loading: boolean; probe: AgentProbe | null };
 // extracted version number. The whole card toggles the agent's settings body open/closed —
 // same chevron affordance as the changelog rows — so the detection status stays visible
 // even when an agent's settings are collapsed.
-function AgentHeader({ icon, name, tagline, state, onRefresh, open, onToggle, tt }: { icon: React.ReactNode; name: string; tagline: string; state: AgentProbeState; onRefresh: () => void; open: boolean; onToggle: () => void; tt: ReturnType<typeof useTooltip>["tt"] }) {
+function AgentHeader({ icon, name, tagline, state, onRefresh, open, onToggle, tt, connected }: { icon: React.ReactNode; name: string; tagline: string; state: AgentProbeState; onRefresh: () => void; open: boolean; onToggle: () => void; tt: ReturnType<typeof useTooltip>["tt"]; connected?: boolean }) {
   const { loading, probe } = state;
   const version = probe?.version?.match(/\d+(?:\.\d+)+/)?.[0];
   return (
@@ -92,6 +95,10 @@ function AgentHeader({ icon, name, tagline, state, onRefresh, open, onToggle, tt
         <div className="settings-agent-name">{name}</div>
         <div className="settings-agent-sub">{probe?.installed && probe.path ? <span className="settings-agent-path" {...ttProps(tt, probe.path)}>{probe.path}</span> : tagline}</div>
       </div>
+      {/* Live-data connection (Claude's statusline hook), shown only once it's working. */}
+      {connected && (
+        <span className="settings-version-chip settings-version-chip-ok" {...ttProps(tt, "Live cost, context and rate-limit data is flowing in")}><Link2 size={10} /> Connected</span>
+      )}
       {loading ? (
         <span className="settings-version-chip settings-version-chip-muted"><Loader2 size={10} className="settings-spin" /> Checking…</span>
       ) : probe?.installed ? (
@@ -167,7 +174,11 @@ function Section({ title, description, children }: { title: string; description?
   );
 }
 
-export function SettingsView({ theme, onSetTheme, defaultAgent, onSetDefaultAgent, gitLazyPolling, onSetGitLazyPolling, gitChangesTree, onSetGitChangesTree, fileExplorerOnStart, onSetFileExplorerOnStart, contextTreeEnabled, onSetContextTreeEnabled, terminalBgColor, onSetTerminalBgColor, defaultTerminalFontSize, onSetDefaultTerminalFontSize, alwaysOnTop, onSetAlwaysOnTop, defaultShell, onSetDefaultShell, fullscreenRendering, onSetFullscreenRendering, forceSyncOutput, onSetForceSyncOutput, webglRendering, onSetWebglRendering, terminalFontWeight, onSetTerminalFontWeight, eagerInitTabs, onSetEagerInitTabs, showRateLimitInSidebar, onSetShowRateLimitInSidebar, showSessionRowMetrics, onSetShowSessionRowMetrics, showSessionRowMetricsCodex, onSetShowSessionRowMetricsCodex, showSessionRowMetricsOpencode, onSetShowSessionRowMetricsOpencode, showRateLimitInSidebarCodex, onSetShowRateLimitInSidebarCodex, showTerminalHeaderStats, onSetShowTerminalHeaderStats, showProjectStatsChart, onSetShowProjectStatsChart, updateInfo }: SettingsViewProps) {
+export const MIN_UI_ZOOM = 80;
+export const MAX_UI_ZOOM = 200;
+export const UI_ZOOM_STEP = 5;
+
+export function SettingsView({ theme, onSetTheme, uiZoom, onSetUiZoom, defaultAgent, onSetDefaultAgent, gitLazyPolling, onSetGitLazyPolling, gitChangesTree, onSetGitChangesTree, fileExplorerOnStart, onSetFileExplorerOnStart, contextTreeEnabled, onSetContextTreeEnabled, terminalBgColor, onSetTerminalBgColor, defaultTerminalFontSize, onSetDefaultTerminalFontSize, alwaysOnTop, onSetAlwaysOnTop, defaultShell, onSetDefaultShell, fullscreenRendering, onSetFullscreenRendering, forceSyncOutput, onSetForceSyncOutput, webglRendering, onSetWebglRendering, terminalFontWeight, onSetTerminalFontWeight, eagerInitTabs, onSetEagerInitTabs, showRateLimitInSidebar, onSetShowRateLimitInSidebar, showSessionRowMetrics, onSetShowSessionRowMetrics, showSessionRowMetricsCodex, onSetShowSessionRowMetricsCodex, showSessionRowMetricsOpencode, onSetShowSessionRowMetricsOpencode, showRateLimitInSidebarCodex, onSetShowRateLimitInSidebarCodex, showTerminalHeaderStats, onSetShowTerminalHeaderStats, showProjectStatsChart, onSetShowProjectStatsChart, updateInfo }: SettingsViewProps) {
   const [active, setActive] = useState<Category>("appearance");
   const [wizardOpen, setWizardOpen] = useState(false);
   // Has the user run the wizard? Drives the disabled-state of the rate-limit + session-row
@@ -231,10 +242,21 @@ export function SettingsView({ theme, onSetTheme, defaultAgent, onSetDefaultAgen
             <>
               <Section title="Theme" description="Color palette for the app shell. Terminals keep their own background setting.">
                 <SettingRow title="Color theme" description="Dark uses the warm near-black canvas; Light uses a warm parchment palette.">
-                  <select className="settings-select" value={theme} onChange={(e) => onSetTheme(e.target.value as ThemeMode)}>
-                    <option value="dark">Dark</option>
-                    <option value="light">Light</option>
-                  </select>
+                  <SelectMenu<ThemeMode> value={theme} onChange={onSetTheme} options={[{ value: "dark", label: "Dark" }, { value: "light", label: "Light" }]} />
+                </SettingRow>
+                <SettingRow title="Interface zoom" description="Scales the whole interface - text, icons, panels and terminals. Useful on 4K and other high-resolution screens. Shortcut from anywhere: Ctrl+Shift+= / Ctrl+Shift+- to zoom, Ctrl+Shift+0 to reset.">
+                  <div className="settings-zoom-col">
+                    {/* Buttons, not a slider: the zoom applies live, so a slider moves out from
+                        under the cursor mid-drag and runs away to the min or max. */}
+                    <div className="settings-zoom-row settings-zoom-row-end">
+                      {uiZoom !== 100 && (
+                        <button className="settings-reset-btn" onClick={() => onSetUiZoom(100)} {...ttProps(tt, "Reset to default")}><RotateCcw size={11} /> Reset</button>
+                      )}
+                      <button className="settings-step-btn" disabled={uiZoom <= MIN_UI_ZOOM} onClick={() => onSetUiZoom(Math.max(MIN_UI_ZOOM, uiZoom - UI_ZOOM_STEP))} {...ttProps(tt, "Zoom out")}><Minus size={12} /></button>
+                      <span className="settings-zoom-value settings-zoom-value-center">{uiZoom}%</span>
+                      <button className="settings-step-btn" disabled={uiZoom >= MAX_UI_ZOOM} onClick={() => onSetUiZoom(Math.min(MAX_UI_ZOOM, uiZoom + UI_ZOOM_STEP))} {...ttProps(tt, "Zoom in")}><Plus size={12} /></button>
+                    </div>
+                  </div>
                 </SettingRow>
               </Section>
 
@@ -257,23 +279,17 @@ export function SettingsView({ theme, onSetTheme, defaultAgent, onSetDefaultAgen
                 return (
                   <Section title="Defaults" description="Which agent hosts a new chat (the + button and the tab dropdown).">
                     <SettingRow title="Default agent" description={multi ? "Pick an agent to start new chats without being asked — or keep “Ask every time” to choose per chat." : "Only one agent was found on this machine, so it's always used. This choice unlocks when a second agent is detected."}>
-                      <select className="settings-select" value={multi ? defaultAgent : single} disabled={!multi} onChange={(e) => onSetDefaultAgent(e.target.value as "ask" | AgentId)}>
-                        {multi ? (
-                          <>
-                            <option value="ask">Ask every time</option>
-                            {installedIds.map(id => <option key={id} value={id}>{AGENTS[id].label}</option>)}
-                          </>
-                        ) : (
-                          <option value={single}>{AGENTS[single as AgentId].label}</option>
-                        )}
-                      </select>
+                      <SelectMenu<"ask" | AgentId> value={multi ? defaultAgent : single} disabled={!multi} onChange={onSetDefaultAgent}
+                        options={multi
+                          ? [{ value: "ask", label: "Ask every time" }, ...installedIds.map(id => ({ value: id, label: AGENTS[id].label }))]
+                          : [{ value: single, label: AGENTS[single as AgentId].label }]} />
                     </SettingRow>
                   </Section>
                 );
               })()}
 
               <div className="settings-agent-block">
-              <AgentHeader icon={<AgentIcon agent="claude" size={15} />} name={AGENTS.claude.label} tagline={AGENTS.claude.tagline} state={agentProbes.claude} onRefresh={probeAgents} open={expandedAgents.claude} onToggle={() => toggleAgent("claude")} tt={tt} />
+              <AgentHeader icon={<AgentIcon agent="claude" size={15} />} name={AGENTS.claude.label} tagline={AGENTS.claude.tagline} state={agentProbes.claude} connected={statslineConfigured} onRefresh={probeAgents} open={expandedAgents.claude} onToggle={() => toggleAgent("claude")} tt={tt} />
               {expandedAgents.claude && <div className="settings-agent-body">
               <div className="settings-connect-hero">
                 <div className="settings-connect-hero-icon"><Sparkles size={18} /></div>
@@ -401,9 +417,7 @@ export function SettingsView({ theme, onSetTheme, defaultAgent, onSetDefaultAgen
                 <SettingRow title="Default shell" description="Shell used when opening a raw terminal tab via the dropdown, and the host shell for agent sessions (Claude Code, Codex).">
                   <div className="settings-shell-row">
                     <ShellIcon id={defaultShell} size={18} />
-                    <select className="settings-select" value={defaultShell} onChange={(e) => onSetDefaultShell(e.target.value)}>
-                      {shells.map(sh => <option key={sh.id} value={sh.id}>{sh.name}</option>)}
-                    </select>
+                    <SelectMenu value={defaultShell} onChange={onSetDefaultShell} options={shells.map(sh => ({ value: sh.id, label: sh.name }))} />
                   </div>
                 </SettingRow>
               </Section>

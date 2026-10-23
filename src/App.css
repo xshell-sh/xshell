@@ -1110,6 +1110,21 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .settings-select { background: var(--bg-deep); border: 1px solid var(--border-default); border-radius: var(--radius-sm); color: var(--text-primary); padding: 5px 8px; font-size: 11px; outline: none; cursor: pointer; min-width: 160px; }
 .settings-select:focus { border-color: var(--accent-terracotta); }
 
+/* App-styled dropdown (SelectMenu) — trigger matches .settings-select, list matches .ctx-menu. */
+.select-menu { position: relative; display: inline-block; min-width: 160px; }
+.select-menu-trigger { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; background: var(--bg-deep); border: 1px solid var(--border-default); border-radius: var(--radius-sm); color: var(--text-primary); padding: 5px 8px; font-size: 11px; font-family: inherit; cursor: pointer; outline: none; transition: border-color 0.12s; text-align: left; }
+.select-menu-trigger:hover:not(:disabled) { border-color: var(--border-strong); }
+.select-menu-trigger:focus-visible, .select-menu-trigger.open { border-color: var(--accent-terracotta); }
+.select-menu-trigger:disabled { opacity: 0.5; cursor: default; }
+.select-menu-value { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.select-menu-chevron { color: var(--text-tertiary); flex-shrink: 0; transition: transform 0.12s; }
+.select-menu-trigger.open .select-menu-chevron { transform: rotate(180deg); }
+.select-menu-list { position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 2000; background: var(--bg-surface); border: 1px solid var(--border-default); border-radius: var(--radius-md); padding: 4px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4); display: flex; flex-direction: column; gap: 1px; animation: fadeIn 0.1s ease; max-height: 280px; overflow-y: auto; }
+.select-menu-list.up { top: auto; bottom: calc(100% + 4px); }
+.select-menu-item { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 10px; border-radius: var(--radius-sm); font-size: 11px; color: var(--text-secondary); cursor: pointer; white-space: nowrap; }
+.select-menu-item.highlighted { background: var(--bg-hover); color: var(--text-primary); }
+.select-menu-item.selected { color: var(--accent-coral); }
+
 /* Settings as a full page (not modal). Flat layout — no extra bordered container. */
 .settings-view { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 .settings-view-header { padding: 28px 32px 20px; flex-shrink: 0; border-bottom: 1px solid var(--border-subtle); }
@@ -1124,6 +1139,11 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 /* Reset button rendered below the slider rather than inline so it doesn't squeeze the
    range track (which used to shrink as soon as the button appeared on value change). */
 .settings-reset-btn-block { align-self: flex-end; }
+.settings-step-btn { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; background: transparent; border: 1px solid var(--border-default); color: var(--text-secondary); border-radius: var(--radius-sm); cursor: pointer; transition: background 0.12s, color 0.12s; }
+.settings-step-btn:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-primary); }
+.settings-step-btn:disabled { opacity: 0.35; cursor: default; }
+.settings-zoom-value-center { text-align: center; min-width: 48px; }
+.settings-zoom-row-end { justify-content: flex-end; }
 .settings-range { flex: 1; appearance: none; -webkit-appearance: none; height: 4px; background: var(--border-default); border-radius: 2px; outline: none; cursor: pointer; }
 .settings-range::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 14px; height: 14px; border-radius: 50%; background: var(--accent-terracotta); cursor: grab; border: none; }
 .settings-range::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: var(--accent-terracotta); cursor: grab; border: none; }

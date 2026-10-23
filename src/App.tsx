@@ -19,6 +19,8 @@ import type { ProjectInfo, ProjectSettings, SessionFolder, SessionInfo, Tab, Gro
 import { GroupView } from "./components/GroupView";
 import { countLeaves, collectLeafIds, insertLeaf, removeLeaf, setRatioAt, DropZone } from "./layout";
 import { useUpdateCheck } from "./hooks/useUpdateCheck";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { MIN_UI_ZOOM, MAX_UI_ZOOM, UI_ZOOM_STEP } from "./components/SettingsView";
 import { UpdateDialog } from "./components/UpdateDialog";
 
 // Flatten sidebar items to an ordered list of project paths (folders expanded in place).
@@ -139,6 +141,8 @@ export default function App() {
   // CSS font weight applied to terminal text. 300 matches the original hardcoded value;
   // 400 reads heavier and helps compensate for the WebGL renderer's grayscale-only AA.
   const [terminalFontWeight, setTerminalFontWeight] = useState(400);
+  // Whole-interface zoom in percent (WebView zoom), for high-DPI screens where the UI reads small.
+  const [uiZoom, setUiZoom] = useState(100);
   // Spawn each restored tab's PTY on app launch instead of deferring until the user clicks the
   // tab. Default OFF — eager-init spawns every restored agent at once on launch (heavy, and
   // burns rate limits on sessions you may not open). Opt in via Settings; a persisted choice
@@ -202,7 +206,7 @@ export default function App() {
     (async () => {
       try {
         const store = await load("settings.json", { defaults: {}, autoSave: true });
-        const [paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode] = await Promise.all([
+        const [paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode, storedZoom] = await Promise.all([
           store.get<string[]>("project_paths"),
           store.get<Record<string, ProjectSettings>>("project_icons"),
           store.get<Tab[]>("open_tabs"),
@@ -231,6 +235,7 @@ export default function App() {
           store.get<boolean>("session_row_metrics_codex"),
           store.get<boolean>("rate_limit_in_sidebar_codex"),
           store.get<boolean>("session_row_metrics_opencode"),
+          store.get<number>("ui_zoom"),
         ]);
         // Layout: prefer the explicit `sidebar_layout` if present; otherwise migrate
         // from the flat `project_paths` list by wrapping each path in a project item.
@@ -261,6 +266,7 @@ export default function App() {
         if (typeof eagerInit === "boolean") setEagerInitTabs(eagerInit);
         if (typeof webgl === "boolean") setWebglRendering(webgl);
         if (typeof fontWeight === "number" && fontWeight >= 100 && fontWeight <= 700) setTerminalFontWeight(fontWeight);
+        if (typeof storedZoom === "number" && storedZoom >= MIN_UI_ZOOM && storedZoom <= MAX_UI_ZOOM) setUiZoom(storedZoom);
         if (typeof termHeaderStats === "boolean") setShowTerminalHeaderStats(termHeaderStats);
         if (typeof projectStatsChart === "boolean") setShowProjectStatsChart(projectStatsChart);
         if (storedTheme === "light" || storedTheme === "dark") setTheme(storedTheme);
@@ -545,6 +551,34 @@ export default function App() {
     try { const store = await load("settings.json", { defaults: {}, autoSave: true }); await store.set("webgl_rendering_enabled", enabled); } catch (_) {}
   }, []);
 
+  // Scales everything (text, icons, terminals); xterm refits through its resize observers.
+  useEffect(() => { getCurrentWebview().setZoom(uiZoom / 100).catch(() => {}); }, [uiZoom]);
+  const persistUiZoom = useCallback(async (percent: number) => {
+    setUiZoom(percent);
+    try { const store = await load("settings.json", { defaults: {}, autoSave: true }); await store.set("ui_zoom", percent); } catch (_) {}
+  }, []);
+  // Global zoom shortcuts: Ctrl+Shift+= / Ctrl+Shift+- / Ctrl+Shift+0 (numpad +/- too), in 5%
+  // steps like the Settings buttons. Plain Ctrl+=/-/0 stay with the terminal font size. The
+  // listener runs in the capture phase so it works while a terminal (xterm) has focus, and
+  // stops the event so the keystroke never reaches the terminal.
+  const uiZoomRef = useRef(uiZoom);
+  uiZoomRef.current = uiZoom;
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.ctrlKey || !e.shiftKey || e.altKey || e.metaKey) return;
+      let next: number | null = null;
+      if (e.code === "Equal" || e.code === "NumpadAdd") next = uiZoomRef.current + UI_ZOOM_STEP;
+      else if (e.code === "Minus" || e.code === "NumpadSubtract") next = uiZoomRef.current - UI_ZOOM_STEP;
+      else if (e.code === "Digit0" || e.code === "Numpad0") next = 100;
+      if (next === null) return;
+      e.preventDefault();
+      e.stopPropagation();
+      next = Math.max(MIN_UI_ZOOM, Math.min(MAX_UI_ZOOM, next));
+      if (next !== uiZoomRef.current) persistUiZoom(next);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [persistUiZoom]);
   const persistTerminalFontWeight = useCallback(async (weight: number) => {
     setTerminalFontWeight(weight);
     try { const store = await load("settings.json", { defaults: {}, autoSave: true }); await store.set("terminal_font_weight", weight); } catch (_) {}
@@ -1138,7 +1172,7 @@ export default function App() {
       <div className="main-content">
         {/* Settings view — hidden unless activeTabId === 'settings' */}
         <div style={{ display: showSettings ? "flex" : "none", flex: 1, overflow: "hidden" }}>
-          <SettingsView theme={theme} onSetTheme={persistTheme} defaultAgent={defaultAgent} onSetDefaultAgent={persistDefaultAgent} gitLazyPolling={gitLazyPolling} onSetGitLazyPolling={persistGitLazyPolling} gitChangesTree={gitChangesTree} onSetGitChangesTree={persistGitChangesTree} fileExplorerOnStart={fileExplorerOnStart} onSetFileExplorerOnStart={persistFileExplorerOnStart} contextTreeEnabled={contextTreeEnabled} onSetContextTreeEnabled={persistContextTreeEnabled} terminalBgColor={terminalBgColor} onSetTerminalBgColor={persistTerminalBgColor} defaultTerminalFontSize={defaultTerminalFontSize} onSetDefaultTerminalFontSize={persistDefaultTerminalFontSize} alwaysOnTop={alwaysOnTop} onSetAlwaysOnTop={persistAlwaysOnTop} defaultShell={defaultShell} onSetDefaultShell={persistDefaultShell} fullscreenRendering={fullscreenRendering} onSetFullscreenRendering={persistFullscreenRendering} forceSyncOutput={forceSyncOutput} onSetForceSyncOutput={persistForceSyncOutput} webglRendering={webglRendering} onSetWebglRendering={persistWebglRendering} terminalFontWeight={terminalFontWeight} onSetTerminalFontWeight={persistTerminalFontWeight} eagerInitTabs={eagerInitTabs} onSetEagerInitTabs={persistEagerInitTabs} showRateLimitInSidebar={showRateLimitInSidebar} onSetShowRateLimitInSidebar={persistShowRateLimitInSidebar} showSessionRowMetrics={showSessionRowMetrics} onSetShowSessionRowMetrics={persistShowSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} onSetShowSessionRowMetricsCodex={persistShowSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} onSetShowSessionRowMetricsOpencode={persistShowSessionRowMetricsOpencode} showRateLimitInSidebarCodex={showRateLimitInSidebarCodex} onSetShowRateLimitInSidebarCodex={persistShowRateLimitInSidebarCodex} showTerminalHeaderStats={showTerminalHeaderStats} onSetShowTerminalHeaderStats={persistShowTerminalHeaderStats} showProjectStatsChart={showProjectStatsChart} onSetShowProjectStatsChart={persistShowProjectStatsChart} updateInfo={updateInfo} />
+          <SettingsView theme={theme} onSetTheme={persistTheme} uiZoom={uiZoom} onSetUiZoom={persistUiZoom} defaultAgent={defaultAgent} onSetDefaultAgent={persistDefaultAgent} gitLazyPolling={gitLazyPolling} onSetGitLazyPolling={persistGitLazyPolling} gitChangesTree={gitChangesTree} onSetGitChangesTree={persistGitChangesTree} fileExplorerOnStart={fileExplorerOnStart} onSetFileExplorerOnStart={persistFileExplorerOnStart} contextTreeEnabled={contextTreeEnabled} onSetContextTreeEnabled={persistContextTreeEnabled} terminalBgColor={terminalBgColor} onSetTerminalBgColor={persistTerminalBgColor} defaultTerminalFontSize={defaultTerminalFontSize} onSetDefaultTerminalFontSize={persistDefaultTerminalFontSize} alwaysOnTop={alwaysOnTop} onSetAlwaysOnTop={persistAlwaysOnTop} defaultShell={defaultShell} onSetDefaultShell={persistDefaultShell} fullscreenRendering={fullscreenRendering} onSetFullscreenRendering={persistFullscreenRendering} forceSyncOutput={forceSyncOutput} onSetForceSyncOutput={persistForceSyncOutput} webglRendering={webglRendering} onSetWebglRendering={persistWebglRendering} terminalFontWeight={terminalFontWeight} onSetTerminalFontWeight={persistTerminalFontWeight} eagerInitTabs={eagerInitTabs} onSetEagerInitTabs={persistEagerInitTabs} showRateLimitInSidebar={showRateLimitInSidebar} onSetShowRateLimitInSidebar={persistShowRateLimitInSidebar} showSessionRowMetrics={showSessionRowMetrics} onSetShowSessionRowMetrics={persistShowSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} onSetShowSessionRowMetricsCodex={persistShowSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} onSetShowSessionRowMetricsOpencode={persistShowSessionRowMetricsOpencode} showRateLimitInSidebarCodex={showRateLimitInSidebarCodex} onSetShowRateLimitInSidebarCodex={persistShowRateLimitInSidebarCodex} showTerminalHeaderStats={showTerminalHeaderStats} onSetShowTerminalHeaderStats={persistShowTerminalHeaderStats} showProjectStatsChart={showProjectStatsChart} onSetShowProjectStatsChart={persistShowProjectStatsChart} updateInfo={updateInfo} />
         </div>
         {/* Home view — hidden when a terminal tab is active */}
         <div style={{ display: showHome ? "flex" : "none", flex: 1, overflow: "hidden" }}>
